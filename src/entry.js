@@ -1,4 +1,5 @@
 import core from './index.js';
+import { enhanceWorkspaceUI } from './workspaces.js';
 
 const MAX_HEALTH_PAGES = 12;
 
@@ -9,155 +10,61 @@ export default {
     if (url.pathname === '/api/integration-debug-site-health') {
       if (!env.SITE_HEALTH_API_URL) return json({ ok: false, error: 'SITE_HEALTH_API_URL is not configured.' }, 503);
       const health = await fetchHealthBatch(env.SITE_HEALTH_API_URL, ['/']);
-      return json({
-        ok: health.ok,
-        configuredUrl: env.SITE_HEALTH_API_URL,
-        resolvedEndpoint: `${String(env.SITE_HEALTH_API_URL).replace(/\/$/, '')}/check`,
-        error: health.error || null,
-        data: health.data || null,
-      }, health.ok ? 200 : 502);
+      return json({ ok: health.ok, configuredUrl: env.SITE_HEALTH_API_URL, resolvedEndpoint: `${String(env.SITE_HEALTH_API_URL).replace(/\/$/, '')}/check`, error: health.error || null, data: health.data || null }, health.ok ? 200 : 502);
     }
 
-    if (url.pathname !== '/api/search') return core.fetch(request, env, ctx);
+    if (url.pathname === '/api/search') return handleSearch(request, env, ctx);
 
     const response = await core.fetch(request, env, ctx);
-    if (!response.ok || !env.SITE_HEALTH_API_URL) return response;
-
-    let payload;
-    try { payload = await response.json(); }
-    catch { return response; }
-    if (!payload?.ok) return json(payload, response.status);
-
-    const candidates = collectCandidatePages(payload).slice(0, MAX_HEALTH_PAGES);
-    if (!candidates.length) {
-      payload.curatorContext = payload.curatorContext || {};
-      payload.curatorContext.siteHealth = { configured: true, ok: true, mode: 'on-demand-batch', checkedPageCount: 0, error: null };
-      return json(payload, response.status);
+    if (url.pathname === '/' && response.ok && (response.headers.get('content-type') || '').includes('text/html')) {
+      const html = await response.text();
+      return new Response(enhanceWorkspaceUI(html), { status: response.status, headers: response.headers });
     }
-
-    const health = await fetchHealthBatch(env.SITE_HEALTH_API_URL, candidates);
-    payload.curatorContext = payload.curatorContext || {};
-    payload.curatorContext.siteHealth = {
-      configured: true,
-      ok: health.ok,
-      mode: 'on-demand-batch',
-      checkedPageCount: health.data?.checkedPageCount || 0,
-      problemPageCount: health.data?.problemPageCount || 0,
-      error: health.error || null,
-    };
-
-    if (health.ok) {
-      const byPage = normalizeHealth(health.data);
-      payload.recommendations = enrichRecommendations(payload.recommendations || [], byPage);
-      payload.today = enrichRecommendations(payload.today || [], byPage);
-    }
-
-    return json(payload, response.status);
+    return response;
   },
 };
 
-function collectCandidatePages(payload) {
-  const seen = new Set();
-  const out = [];
-  for (const item of [...(payload.today || []), ...(payload.recommendations || [])]) {
-    const path = normalizePage(item?.page || item?.path || '');
-    if (!path || seen.has(path)) continue;
-    seen.add(path);
-    out.push(path);
+async function handleSearch(request, env, ctx) {
+  const response = await core.fetch(request, env, ctx);
+  if (!response.ok || !env.SITE_HEALTH_API_URL) return response;
+  let payload;
+  try { payload = await response.json(); } catch { return response; }
+  if (!payload?.ok) return json(payload, response.status);
+
+  const candidates = collectCandidatePages(payload).slice(0, MAX_HEALTH_PAGES);
+  if (!candidates.length) {
+    payload.curatorContext = payload.curatorContext || {};
+    payload.curatorContext.siteHealth = { configured: true, ok: true, mode: 'on-demand-batch', checkedPageCount: 0, error: null };
+    return json(payload, response.status);
   }
-  return out;
+
+  const health = await fetchHealthBatch(env.SITE_HEALTH_API_URL, candidates);
+  payload.curatorContext = payload.curatorContext || {};
+  payload.curatorContext.siteHealth = { configured: true, ok: health.ok, mode: 'on-demand-batch', checkedPageCount: health.data?.checkedPageCount || 0, problemPageCount: health.data?.problemPageCount || 0, error: health.error || null };
+  if (health.ok) {
+    const byPage = normalizeHealth(health.data);
+    payload.recommendations = enrichRecommendations(payload.recommendations || [], byPage);
+    payload.today = enrichRecommendations(payload.today || [], byPage);
+  }
+  return json(payload, response.status);
 }
+
+function collectCandidatePages(payload) { const seen = new Set(), out = []; for (const item of [...(payload.today || []), ...(payload.recommendations || [])]) { const path = normalizePage(item?.page || item?.path || ''); if (!path || seen.has(path)) continue; seen.add(path); out.push(path); } return out; }
 
 async function fetchHealthBatch(baseUrl, pages) {
   const endpoint = `${String(baseUrl).replace(/\/$/, '')}/check`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 12000);
+  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 12000);
   try {
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        accept: 'application/json',
-        'user-agent': 'CuratorOS-Search-Intelligence/1.1',
-      },
-      body: JSON.stringify({ pages }),
-      signal: controller.signal,
-    });
-    const text = await response.text();
-    let data = null;
-    try { data = text ? JSON.parse(text) : null; }
-    catch { throw new Error(`site-health returned non-JSON HTTP ${response.status}: ${text.slice(0, 180)}`); }
+    const response = await fetch(endpoint, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json', 'user-agent': 'CuratorOS-Search-Intelligence/1.1' }, body: JSON.stringify({ pages }), signal: controller.signal });
+    const text = await response.text(); let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { throw new Error(`site-health returned non-JSON HTTP ${response.status}: ${text.slice(0, 180)}`); }
     if (!response.ok || data?.ok === false) throw new Error(data?.error || `site-health returned HTTP ${response.status}`);
     return { ok: true, data };
-  } catch (error) {
-    return { ok: false, data: null, error: error?.name === 'AbortError' ? 'site-health batch timed out' : (error?.message || String(error)) };
-  } finally {
-    clearTimeout(timer);
-  }
+  } catch (error) { return { ok: false, data: null, error: error?.name === 'AbortError' ? 'site-health batch timed out' : (error?.message || String(error)) }; }
+  finally { clearTimeout(timer); }
 }
 
-function normalizeHealth(data) {
-  const map = new Map();
-  for (const item of Array.isArray(data?.pages) ? data.pages : []) {
-    const path = normalizePage(item.path || item.url || '');
-    if (!path) continue;
-    map.set(path, {
-      ok: item.ok !== false,
-      httpStatus: Number(item.httpStatus || 0) || null,
-      canonicalOk: item.canonicalOk !== false,
-      indexable: item.indexable !== false,
-      issues: Array.isArray(item.issues) ? item.issues.map(String) : [],
-    });
-  }
-  return map;
-}
-
-function enrichRecommendations(items, healthByPage) {
-  return items.map(item => {
-    const path = normalizePage(item.page || item.path || '');
-    const health = healthByPage.get(path);
-    if (!health) return item;
-
-    const evidence = [...(item.evidence || [])];
-    evidence.push(`Site Health: ${health.ok ? 'healthy' : 'attention needed'}${health.issues.length ? ` · ${health.issues.length} issue(s)` : ''}`);
-    const context = { ...(item.context || {}), siteHealth: { ...health, issueCount: health.issues.length } };
-
-    if (health.ok && health.canonicalOk && health.indexable && (!health.httpStatus || health.httpStatus < 400)) {
-      return { ...item, evidence, context };
-    }
-
-    return {
-      ...item,
-      priorityScore: Math.min(100, Number(item.priorityScore || 0) + 10),
-      action: 'Fix the Site Health blocker before changing content. Reassess ranking performance after the technical issue is resolved.',
-      evidence,
-      context,
-    };
-  }).sort((a, b) => Number(b.priorityScore || 0) - Number(a.priorityScore || 0));
-}
-
-function normalizePage(value) {
-  if (!value) return '';
-  try {
-    const url = new URL(String(value), 'https://oceanliners.net');
-    let path = url.pathname || '/';
-    path = path.replace(/\/index\.html?$/i, '/').replace(/\.html?$/i, '');
-    if (path.length > 1) path = path.replace(/\/$/, '');
-    return path || '/';
-  } catch {
-    let path = String(value).trim();
-    if (!path.startsWith('/')) path = `/${path}`;
-    return path.replace(/\.html?$/i, '').replace(/\/$/, '') || '/';
-  }
-}
-
-function json(value, status = 200) {
-  return new Response(JSON.stringify(value), {
-    status,
-    headers: {
-      'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store',
-      'x-content-type-options': 'nosniff',
-    },
-  });
-}
+function normalizeHealth(data) { const map = new Map(); for (const item of Array.isArray(data?.pages) ? data.pages : []) { const path = normalizePage(item.path || item.url || ''); if (!path) continue; map.set(path, { ok: item.ok !== false, httpStatus: Number(item.httpStatus || 0) || null, canonicalOk: item.canonicalOk !== false, indexable: item.indexable !== false, issues: Array.isArray(item.issues) ? item.issues.map(String) : [] }); } return map; }
+function enrichRecommendations(items, healthByPage) { return items.map(item => { const path = normalizePage(item.page || item.path || ''); const health = healthByPage.get(path); if (!health) return item; const evidence = [...(item.evidence || [])]; evidence.push(`Site Health: ${health.ok ? 'healthy' : 'attention needed'}${health.issues.length ? ` · ${health.issues.length} issue(s)` : ''}`); const context = { ...(item.context || {}), siteHealth: { ...health, issueCount: health.issues.length } }; if (health.ok && health.canonicalOk && health.indexable && (!health.httpStatus || health.httpStatus < 400)) return { ...item, evidence, context }; return { ...item, priorityScore: Math.min(100, Number(item.priorityScore || 0) + 10), action: 'Fix the Site Health blocker before changing content. Reassess ranking performance after the technical issue is resolved.', evidence, context }; }).sort((a, b) => Number(b.priorityScore || 0) - Number(a.priorityScore || 0)); }
+function normalizePage(value) { if (!value) return ''; try { const url = new URL(String(value), 'https://oceanliners.net'); let path = url.pathname || '/'; path = path.replace(/\/index\.html?$/i, '/').replace(/\.html?$/i, ''); if (path.length > 1) path = path.replace(/\/$/, ''); return path || '/'; } catch { let path = String(value).trim(); if (!path.startsWith('/')) path = `/${path}`; return path.replace(/\.html?$/i, '').replace(/\/$/, '') || '/'; } }
+function json(value, status = 200) { return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' } }); }

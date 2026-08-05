@@ -91,6 +91,7 @@ async function buildLivePayload(env, days) {
     top50: buckets.top50 - previousBuckets.top50,
   };
   const recommendations = buildRecommendations(queries);
+  const today = buildTodayQueue(recommendations);
   const movers = buildMovers(queries, pages);
 
   return {
@@ -106,6 +107,7 @@ async function buildLivePayload(env, days) {
     previousBuckets,
     bucketDelta,
     recommendations,
+    today,
     movers,
     queries: queries.slice(0, 100),
     pages,
@@ -345,29 +347,100 @@ function buildRecommendations(queries) {
   const recs = [];
 
   for (const x of candidates) {
+    let base;
     if (x.leftTop10 && x.previousImpressions >= 50) {
-      recs.push({ ...x, type: 'decline', title: 'Top-10 ranking lost', rationale: `This query moved from #${round1(x.previousPosition)} to #${round1(x.position)}. Review recent page changes, competing intent, and internal support.` });
+      base = { type: 'decline', title: 'Top-10 ranking lost', action: 'Investigate the page before making broad edits. Check recent changes, query intent, competing URLs, and internal support.', rationale: `This query moved from #${round1(x.previousPosition)} to #${round1(x.position)}.` };
     } else if (x.enteredTop10 && x.impressions >= 50) {
-      recs.push({ ...x, type: 'breakthrough', title: 'Entered the Top 10', rationale: `This query improved from ${x.previousPosition ? '#' + round1(x.previousPosition) : 'outside the measured period'} to #${round1(x.position)}. Protect the gain rather than rewriting aggressively.` });
+      base = { type: 'breakthrough', title: 'Entered the Top 10', action: 'Protect the gain. Favor supportive internal links and avoid unnecessary rewrites.', rationale: `This query improved from ${x.previousPosition ? '#' + round1(x.previousPosition) : 'outside the measured period'} to #${round1(x.position)}.` };
     } else if (x.position >= 8 && x.position <= 20 && x.impressions >= 100 && x.positionChange >= 1) {
-      recs.push({ ...x, type: 'strengthen', title: 'Rising near-page-one opportunity', rationale: `Position improved by ${round1(x.positionChange)} places while the query remains close to page one. This is a strong candidate for focused internal linking or a targeted content refinement.` });
+      base = { type: 'strengthen', title: 'Rising near-page-one opportunity', action: 'Strengthen internal support first; then make only targeted content refinements if the page does not fully answer the query.', rationale: `Position improved by ${round1(x.positionChange)} places while the query remains close to page one.` };
     } else if (x.position >= 8 && x.position <= 20 && x.impressions >= 100) {
-      recs.push({ ...x, type: 'strengthen', title: 'Near-page-one opportunity', rationale: 'Meaningful visibility with an average position close enough that focused improvements may move the page onto page one.' });
+      base = { type: 'strengthen', title: 'Near-page-one opportunity', action: 'Add contextual internal support and inspect whether the page can answer this query more directly without creating duplicate content.', rationale: 'Meaningful visibility with an average position close enough that focused improvements may move the page onto page one.' };
     } else if (x.isNew && x.impressions >= 75) {
-      recs.push({ ...x, type: 'emerging', title: 'Emerging query', rationale: `This query generated ${Math.round(x.impressions)} impressions in the current period after having none in the previous comparison period.` });
+      base = { type: 'emerging', title: 'Emerging query', action: 'Confirm that the current page is the correct destination for this intent, then strengthen the surrounding topic cluster if appropriate.', rationale: `This query generated ${Math.round(x.impressions)} impressions in the current period after having none in the previous comparison period.` };
     } else if (x.position <= 5 && x.impressions >= 100 && x.ctr >= 4 && Math.abs(x.positionChange) < 1.5 && x.impressionChange > -20) {
-      recs.push({ ...x, type: 'leave', title: 'Leave it alone', rationale: 'Strong ranking, healthy click-through rate, and no material deterioration. No intervention is recommended.' });
+      base = { type: 'leave', title: 'Leave it alone', action: 'No editorial action. Monitor and preserve supporting links.', rationale: 'Strong ranking, healthy click-through rate, and no material deterioration.' };
     } else if (x.position <= 10 && x.impressions >= 100 && x.ctr < 2.5) {
-      recs.push({ ...x, type: 'ctr', title: 'Improve search snippet', rationale: `The page ranks well enough to earn clicks, but CTR is ${round1(x.ctr)}%. Review title, snippet context, and query intent.` });
+      base = { type: 'ctr', title: 'Improve search snippet', action: 'Review the title, description, and on-page framing for alignment with the query before changing the body content.', rationale: `The page ranks well enough to earn clicks, but CTR is ${round1(x.ctr)}%.` };
     } else if (x.position <= 10 && x.impressions >= 100) {
-      recs.push({ ...x, type: 'protect', title: 'Protect a winner', rationale: 'The page is already performing well. Favor supporting links and stability over aggressive rewriting.' });
+      base = { type: 'protect', title: 'Protect a winner', action: 'Keep the page stable and maintain healthy internal support. Do not optimize aggressively.', rationale: 'The page is already performing well.' };
     }
+
+    if (!base) continue;
+    recs.push(enrichRecommendation({ ...x, ...base }));
   }
 
-  const priority = { decline: 7, strengthen: 6, emerging: 5, ctr: 4, breakthrough: 3, protect: 2, leave: 1 };
   return recs
-    .sort((a, b) => (priority[b.type] - priority[a.type]) || (b.impressions - a.impressions))
-    .slice(0, 16);
+    .sort((a, b) => b.priorityScore - a.priorityScore || b.impressions - a.impressions)
+    .slice(0, 20);
+}
+
+function enrichRecommendation(rec) {
+  const typeBase = { decline: 24, strengthen: 22, emerging: 18, ctr: 17, breakthrough: 16, protect: 10, leave: 4 }[rec.type] || 8;
+  const volume = rec.impressions >= 5000 ? 25 : rec.impressions >= 2000 ? 22 : rec.impressions >= 1000 ? 19 : rec.impressions >= 500 ? 15 : rec.impressions >= 200 ? 11 : 6;
+  const proximity = rec.type === 'decline'
+    ? Math.min(20, Math.max(6, Math.abs(rec.positionChange || 0) * 3))
+    : rec.position > 0 && rec.position <= 20
+      ? Math.max(4, 21 - Math.abs(10 - rec.position) * 1.4)
+      : 5;
+  const momentum = Math.min(15, Math.max(0, Math.abs(rec.positionChange || 0) * 2 + Math.min(7, Math.abs(rec.impressionChange || 0) / 15)));
+  const ctrOpportunity = rec.type === 'ctr' ? 10 : rec.ctr < 3 && rec.position <= 10 ? 7 : 2;
+  const confidenceBonus = rec.impressions >= 1000 ? 5 : rec.impressions >= 300 ? 3 : 1;
+  const priorityScore = Math.max(0, Math.min(100, Math.round(typeBase + volume + proximity + momentum + ctrOpportunity + confidenceBonus)));
+
+  const confidence = rec.impressions >= 1000 && (rec.previousImpressions >= 300 || rec.isNew) ? 'high' : rec.impressions >= 250 ? 'medium' : 'low';
+  const expectedUpside = rec.type === 'leave' || rec.type === 'protect' || rec.type === 'breakthrough'
+    ? 'protect'
+    : priorityScore >= 78
+      ? 'high'
+      : priorityScore >= 58
+        ? 'medium'
+        : 'low';
+
+  const evidence = [
+    `Position ${rec.previousPosition ? '#' + round1(rec.previousPosition) + ' → ' : ''}#${round1(rec.position)}`,
+    `${Math.round(rec.impressions)} impressions (${signedPercent(rec.impressionChange)} vs prior period)`,
+    `${Math.round(rec.clicks)} clicks (${signedPercent(rec.clicksChange)} vs prior period)`,
+    `CTR ${round1(rec.ctr)}% (${signedPoints(rec.ctrChange)} pts)`,
+  ];
+
+  return {
+    ...rec,
+    priorityScore,
+    confidence,
+    expectedUpside,
+    evidence,
+    signals: {
+      impressions: rec.impressions,
+      clicks: rec.clicks,
+      ctr: rec.ctr,
+      position: rec.position,
+      impressionChange: rec.impressionChange,
+      clicksChange: rec.clicksChange,
+      ctrChange: rec.ctrChange,
+      positionChange: rec.positionChange,
+      enteredTop10: rec.enteredTop10,
+      leftTop10: rec.leftTop10,
+      isNew: rec.isNew,
+    },
+  };
+}
+
+function buildTodayQueue(recommendations) {
+  const actionable = recommendations.filter(x => x.type !== 'leave');
+  const highValue = actionable.filter(x => x.priorityScore >= 55 && x.confidence !== 'low');
+  const source = highValue.length >= 3 ? highValue : actionable;
+  return source.slice(0, 8).map((x, index) => ({ ...x, rank: index + 1 }));
+}
+
+function signedPercent(value) {
+  const n = Number(value || 0);
+  return `${n >= 0 ? '+' : ''}${round1(n)}%`;
+}
+
+function signedPoints(value) {
+  const n = Number(value || 0);
+  return `${n >= 0 ? '+' : ''}${round1(n)}`;
 }
 
 function buildMovers(queries, pages) {
@@ -393,6 +466,12 @@ function json(data, status = 200) {
 }
 
 function demoPayload() {
+  const recommendations = [
+    enrichRecommendation({ type: 'strengthen', title: 'Rising near-page-one opportunity', action: 'Strengthen internal support first; then make only targeted content refinements if needed.', query: 'ss leviathan history', page: '/ships/ss-leviathan', position: 11.8, previousPosition: 18.2, positionChange: 6.4, impressions: 3180, previousImpressions: 1939, impressionChange: 64, clicks: 381, previousClicks: 212, clicksChange: 79.7, ctr: 12.0, previousCtr: 10.9, ctrChange: 1.1, rationale: 'Position improved by 6.4 places while the query remains close to page one.' }),
+    enrichRecommendation({ type: 'breakthrough', title: 'Entered the Top 10', action: 'Protect the gain. Favor supportive internal links and avoid unnecessary rewrites.', query: 'ocean liner vs cruise ship', page: '/ocean-liner-cruise-ship', position: 6.3, previousPosition: 11.1, positionChange: 4.8, impressions: 8420, previousImpressions: 6100, impressionChange: 38, clicks: 522, previousClicks: 301, clicksChange: 73, ctr: 6.2, previousCtr: 4.9, ctrChange: 1.3, enteredTop10: true, rationale: 'This query entered the Top 10.' }),
+    enrichRecommendation({ type: 'leave', title: 'Leave it alone', action: 'No editorial action. Monitor and preserve supporting links.', query: 'how long did titanic take to sink', page: '/how-long-did-it-take-titanic-to-sink', position: 3.7, previousPosition: 3.9, positionChange: 0.2, impressions: 11320, previousImpressions: 10874, impressionChange: 4.1, clicks: 682, previousClicks: 645, clicksChange: 5.8, ctr: 6.02, previousCtr: 5.93, ctrChange: 0.09, rationale: 'Strong ranking, healthy click-through rate, and no material deterioration.' }),
+  ];
+
   return {
     mode: 'demo',
     period: '28 days',
@@ -402,11 +481,8 @@ function demoPayload() {
     buckets: { top3: 28, top10: 94, top20: 181, top50: 463 },
     previousBuckets: { top3: 22, top10: 77, top20: 154, top50: 429 },
     bucketDelta: { top3: 6, top10: 17, top20: 27, top50: 34 },
-    recommendations: [
-      { type: 'strengthen', title: 'Rising near-page-one opportunity', query: 'ss leviathan history', page: '/ships/ss-leviathan', position: 11.8, previousPosition: 18.2, positionChange: 6.4, impressions: 3180, rationale: 'Position improved by 6.4 places while the query remains close to page one.' },
-      { type: 'breakthrough', title: 'Entered the Top 10', query: 'ocean liner vs cruise ship', page: '/ocean-liner-cruise-ship', position: 6.3, previousPosition: 11.1, impressions: 8420, rationale: 'This query entered the Top 10. Protect the gain rather than rewriting aggressively.' },
-      { type: 'leave', title: 'Leave it alone', query: 'how long did titanic take to sink', page: '/how-long-did-it-take-titanic-to-sink', position: 3.7, previousPosition: 3.9, impressions: 11320, rationale: 'Strong ranking, healthy click-through rate, and no material deterioration.' },
-    ],
+    recommendations,
+    today: buildTodayQueue(recommendations),
     movers: { enteredTop10: [], leftTop10: [], emerging: [], risingQueries: [], fallingQueries: [], risingPages: [], fallingPages: [] },
     queries: [],
     pages: [
@@ -426,8 +502,8 @@ function renderApp() {
 <meta name="description" content="CuratorOS search performance and SEO opportunity intelligence for oceanliners.net.">
 <style>
 :root{--bg:#07100f;--ink:#f3eee3;--muted:#b7b2a7;--brass:#bfa46a;--line:rgba(191,164,106,.28);--good:#93c59e;--bad:#d98b83;--shadow:0 18px 50px rgba(0,0,0,.3)}
-*{box-sizing:border-box}html{background:var(--bg);color:var(--ink);font-family:Georgia,'Times New Roman',serif}body{margin:0;min-height:100vh;background:radial-gradient(circle at 50% 0,rgba(191,164,106,.08),transparent 32rem),linear-gradient(180deg,#091310,#07100f)}.shell{max-width:1480px;margin:auto;padding:24px}.topbar{display:flex;gap:18px;align-items:center;justify-content:space-between;padding:10px 0 24px;border-bottom:1px solid var(--line)}.brand{display:flex;gap:14px;align-items:center}.mark{width:42px;height:42px;border:1px solid var(--brass);display:grid;place-items:center;font-weight:bold;color:var(--brass);transform:rotate(45deg)}.mark span{transform:rotate(-45deg)}.brand small,.eyebrow{display:block;color:var(--brass);text-transform:uppercase;letter-spacing:.18em;font:700 11px/1.4 system-ui,sans-serif}.brand strong{font-size:21px}.controls{display:flex;gap:9px;flex-wrap:wrap}.btn,.select{border:1px solid var(--line);background:#0a1412;color:var(--ink);border-radius:999px;padding:9px 13px;font:600 13px system-ui,sans-serif}.btn{cursor:pointer}.btn.primary{border-color:var(--brass);color:#0b100e;background:var(--brass)}.hero{display:grid;grid-template-columns:1.3fr .7fr;gap:18px;padding:32px 0 18px}.hero h1{font-size:clamp(34px,5vw,66px);line-height:.98;margin:8px 0 14px;max-width:900px}.hero p{color:var(--muted);font-size:17px;line-height:1.65;max-width:770px}.status,.card{border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.025),rgba(255,255,255,.012));border-radius:18px;padding:18px;box-shadow:var(--shadow)}.status{align-self:end}.status strong{font:700 13px system-ui,sans-serif}.status p{font-size:13px;margin:7px 0 0}.grid{display:grid;gap:14px}.metrics{grid-template-columns:repeat(4,1fr);margin:12px 0 22px}.metric span{color:var(--muted);font:600 12px system-ui,sans-serif;text-transform:uppercase;letter-spacing:.08em}.metric strong{display:block;font-size:34px;margin-top:10px}.metric em{font:600 12px system-ui,sans-serif;font-style:normal}.good{color:var(--good)}.bad{color:var(--bad)}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin:30px 0 12px}.section-head h2{font-size:25px;margin:0}.section-head p{font:13px system-ui,sans-serif;color:var(--muted);margin:0}.layout{grid-template-columns:1.05fr .95fr}.rec{display:grid;grid-template-columns:auto 1fr auto;gap:14px;padding:15px 0;border-bottom:1px solid rgba(191,164,106,.16)}.badge{width:38px;height:38px;border:1px solid var(--line);border-radius:11px;display:grid;place-items:center;font:800 13px system-ui,sans-serif;color:var(--brass)}.rec h3{font:700 15px system-ui,sans-serif;margin:0 0 5px}.rec p{font:13px/1.5 system-ui,sans-serif;color:var(--muted);margin:0}.rec .stat{text-align:right;font:700 13px system-ui,sans-serif}.rec .stat small{display:block;color:var(--muted);font-weight:500;margin-top:4px}.bucket-grid{grid-template-columns:repeat(2,1fr);margin-top:14px}.bucket strong{display:block;font-size:28px}.bucket span{font:12px system-ui,sans-serif;color:var(--muted)}table{width:100%;border-collapse:collapse;font:13px system-ui,sans-serif}th{text-align:left;color:var(--brass);font-size:11px;letter-spacing:.08em;text-transform:uppercase;padding:10px 8px;border-bottom:1px solid var(--line)}td{padding:13px 8px;border-bottom:1px solid rgba(191,164,106,.12)}td.num{text-align:right;font-variant-numeric:tabular-nums}.tabs{display:flex;gap:8px;margin:4px 0 16px;overflow:auto}.tab{white-space:nowrap;border:1px solid var(--line);border-radius:999px;padding:8px 12px;font:600 12px system-ui,sans-serif;background:transparent;color:var(--muted)}.tab.active{background:rgba(191,164,106,.12);color:var(--ink);border-color:var(--brass)}.foot{padding:28px 0 10px;color:var(--muted);font:12px/1.6 system-ui,sans-serif}
-@media(max-width:900px){.hero,.layout{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}.hero{padding-top:24px}.shell{padding:16px}.topbar{align-items:flex-start}.controls{justify-content:flex-end}.status{align-self:auto}}
+*{box-sizing:border-box}html{background:var(--bg);color:var(--ink);font-family:Georgia,'Times New Roman',serif}body{margin:0;min-height:100vh;background:radial-gradient(circle at 50% 0,rgba(191,164,106,.08),transparent 32rem),linear-gradient(180deg,#091310,#07100f)}.shell{max-width:1480px;margin:auto;padding:24px}.topbar{display:flex;gap:18px;align-items:center;justify-content:space-between;padding:10px 0 24px;border-bottom:1px solid var(--line)}.brand{display:flex;gap:14px;align-items:center}.mark{width:42px;height:42px;border:1px solid var(--brass);display:grid;place-items:center;font-weight:bold;color:var(--brass);transform:rotate(45deg)}.mark span{transform:rotate(-45deg)}.brand small,.eyebrow{display:block;color:var(--brass);text-transform:uppercase;letter-spacing:.18em;font:700 11px/1.4 system-ui,sans-serif}.brand strong{font-size:21px}.controls{display:flex;gap:9px;flex-wrap:wrap}.btn,.select{border:1px solid var(--line);background:#0a1412;color:var(--ink);border-radius:999px;padding:9px 13px;font:600 13px system-ui,sans-serif}.btn{cursor:pointer}.hero{display:grid;grid-template-columns:1.3fr .7fr;gap:18px;padding:32px 0 18px}.hero h1{font-size:clamp(34px,5vw,66px);line-height:.98;margin:8px 0 14px;max-width:900px}.hero p{color:var(--muted);font-size:17px;line-height:1.65;max-width:770px}.status,.card{border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.025),rgba(255,255,255,.012));border-radius:18px;padding:18px;box-shadow:var(--shadow)}.status{align-self:end}.status strong{font:700 13px system-ui,sans-serif}.status p{font-size:13px;margin:7px 0 0}.grid{display:grid;gap:14px}.metrics{grid-template-columns:repeat(4,1fr);margin:12px 0 22px}.metric span{color:var(--muted);font:600 12px system-ui,sans-serif;text-transform:uppercase;letter-spacing:.08em}.metric strong{display:block;font-size:34px;margin-top:10px}.metric em{font:600 12px system-ui,sans-serif;font-style:normal}.good{color:var(--good)}.bad{color:var(--bad)}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin:30px 0 12px}.section-head h2{font-size:25px;margin:0}.section-head p{font:13px system-ui,sans-serif;color:var(--muted);margin:0}.layout{grid-template-columns:1.05fr .95fr}.rec{display:grid;grid-template-columns:auto 1fr auto;gap:14px;padding:15px 0;border-bottom:1px solid rgba(191,164,106,.16)}.badge{width:38px;height:38px;border:1px solid var(--line);border-radius:11px;display:grid;place-items:center;font:800 13px system-ui,sans-serif;color:var(--brass)}.rec h3{font:700 15px system-ui,sans-serif;margin:0 0 5px}.rec p{font:13px/1.5 system-ui,sans-serif;color:var(--muted);margin:0}.rec .stat{text-align:right;font:700 13px system-ui,sans-serif}.rec .stat small{display:block;color:var(--muted);font-weight:500;margin-top:4px}.bucket-grid{grid-template-columns:repeat(2,1fr);margin-top:14px}.bucket strong{display:block;font-size:28px}.bucket span{font:12px system-ui,sans-serif;color:var(--muted)}.today-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.action-card{border:1px solid var(--line);background:linear-gradient(180deg,rgba(191,164,106,.055),rgba(255,255,255,.015));border-radius:16px;padding:16px}.action-top{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}.action-rank{font:800 12px system-ui,sans-serif;color:var(--brass);letter-spacing:.08em;text-transform:uppercase}.score{font:800 18px system-ui,sans-serif}.meta{display:flex;gap:7px;flex-wrap:wrap;margin:10px 0}.pill{border:1px solid var(--line);border-radius:999px;padding:5px 8px;font:700 10px system-ui,sans-serif;text-transform:uppercase;letter-spacing:.06em}.action-card h3{font:700 17px system-ui,sans-serif;margin:4px 0 6px}.action-card p{font:13px/1.5 system-ui,sans-serif;color:var(--muted);margin:0 0 10px}.action-next{border-top:1px solid rgba(191,164,106,.16);padding-top:10px;color:var(--ink)!important}.evidence{margin:8px 0 0;padding-left:16px;color:var(--muted);font:12px/1.5 system-ui,sans-serif}table{width:100%;border-collapse:collapse;font:13px system-ui,sans-serif}th{text-align:left;color:var(--brass);font-size:11px;letter-spacing:.08em;text-transform:uppercase;padding:10px 8px;border-bottom:1px solid var(--line)}td{padding:13px 8px;border-bottom:1px solid rgba(191,164,106,.12)}td.num{text-align:right;font-variant-numeric:tabular-nums}.tabs{display:flex;gap:8px;margin:4px 0 16px;overflow:auto}.tab{white-space:nowrap;border:1px solid var(--line);border-radius:999px;padding:8px 12px;font:600 12px system-ui,sans-serif;background:transparent;color:var(--muted)}.tab.active{background:rgba(191,164,106,.12);color:var(--ink);border-color:var(--brass)}.foot{padding:28px 0 10px;color:var(--muted);font:12px/1.6 system-ui,sans-serif}
+@media(max-width:900px){.hero,.layout{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}.today-grid{grid-template-columns:1fr}.hero{padding-top:24px}.shell{padding:16px}.topbar{align-items:flex-start}.controls{justify-content:flex-end}.status{align-self:auto}}
 @media(max-width:560px){.metrics{grid-template-columns:1fr 1fr}.metric strong{font-size:27px}.brand strong{font-size:17px}.mark{width:36px;height:36px}.controls .btn:not(.primary){display:none}.rec{grid-template-columns:auto 1fr}.rec .stat{grid-column:2;text-align:left}.hero h1{font-size:40px}}
 </style>
 </head>
@@ -448,6 +524,10 @@ function renderApp() {
  <div class="card metric"><span>Average position</span><strong id="position">—</strong><em id="positionDelta">—</em></div>
 </div>
 <div class="tabs"><button class="tab active">Overview</button><button class="tab">Opportunities</button><button class="tab">Pages</button><button class="tab">Queries</button><button class="tab">Index Monitor</button><button class="tab">Technical</button></div>
+<section>
+  <div class="section-head"><div><span class="eyebrow">Today</span><h2>Highest-value actions</h2></div><p>Short queue · evidence-weighted</p></div>
+  <div class="today-grid" id="today"></div>
+</section>
 <div class="grid layout">
 <section class="card"><div class="section-head"><div><span class="eyebrow">Decision engine</span><h2>What should I work on?</h2></div><p>Period-over-period priorities</p></div><div id="recommendations"></div></section>
 <section class="card"><div class="section-head"><div><span class="eyebrow">Ranking footprint</span><h2>Where the site appears</h2></div><p>Current query buckets</p></div><div class="grid bucket-grid" id="buckets"></div></section>
@@ -486,7 +566,8 @@ async function load(){
   const bd=d.bucketDelta||{};
   document.querySelector('#buckets').innerHTML=[['Top 3',d.buckets.top3,bd.top3],['Top 10',d.buckets.top10,bd.top10],['Top 20',d.buckets.top20,bd.top20],['Top 50',d.buckets.top50,bd.top50]].map(x=>'<div class="bucket"><strong>'+fmt(x[1])+'</strong><span>queries in '+x[0]+' · <b class="'+deltaClass(x[2]||0)+'">'+signed(x[2]||0)+'</b></span></div>').join('');
   const icon={strengthen:'↑',protect:'◆',ctr:'↗',leave:'✓',decline:'↓',breakthrough:'★',emerging:'+'};
-  document.querySelector('#recommendations').innerHTML=(d.recommendations||[]).map(x=>'<article class="rec"><div class="badge">'+(icon[x.type]||'•')+'</div><div><h3>'+x.title+'</h3><p><strong>'+escapeHtml(x.query)+'</strong> · '+escapeHtml(x.page)+'<br>'+escapeHtml(x.rationale)+'</p></div><div class="stat">#'+(x.position||0).toFixed(1)+'<small>'+fmt(x.impressions)+' impr.</small></div></article>').join('')||'<p style="color:var(--muted);font:14px system-ui,sans-serif">No high-confidence recommendations in this period.</p>';
+  document.querySelector('#today').innerHTML=(d.today||[]).map(x=>'<article class="action-card"><div class="action-top"><div><div class="action-rank">Priority '+x.rank+'</div><h3>'+escapeHtml(x.title)+'</h3></div><div class="score">'+fmt(x.priorityScore)+'</div></div><p><strong>'+escapeHtml(x.query)+'</strong><br>'+escapeHtml(x.page)+'</p><div class="meta"><span class="pill">'+escapeHtml(x.confidence)+' confidence</span><span class="pill">'+escapeHtml(x.expectedUpside)+' upside</span><span class="pill">#'+(x.position||0).toFixed(1)+'</span></div><p>'+escapeHtml(x.rationale)+'</p><ul class="evidence">'+(x.evidence||[]).slice(0,3).map(e=>'<li>'+escapeHtml(e)+'</li>').join('')+'</ul><p class="action-next"><strong>Next:</strong> '+escapeHtml(x.action)+'</p></article>').join('')||'<div class="card"><p style="color:var(--muted);font:14px system-ui,sans-serif">No high-confidence actions are demanding attention in this period.</p></div>';
+  document.querySelector('#recommendations').innerHTML=(d.recommendations||[]).map(x=>'<article class="rec"><div class="badge">'+(icon[x.type]||'•')+'</div><div><h3>'+x.title+'</h3><p><strong>'+escapeHtml(x.query)+'</strong> · '+escapeHtml(x.page)+'<br>'+escapeHtml(x.rationale)+'<br><b>Action:</b> '+escapeHtml(x.action)+'</p></div><div class="stat">'+fmt(x.priorityScore)+'/100<small>'+escapeHtml(x.confidence)+' confidence</small></div></article>').join('')||'<p style="color:var(--muted);font:14px system-ui,sans-serif">No high-confidence recommendations in this period.</p>';
   document.querySelector('#pages').innerHTML=(d.pages||[]).slice(0,50).map(x=>'<tr><td>'+escapeHtml(x.path)+'</td><td class="num">'+fmt(x.clicks)+'</td><td class="num">'+fmt(x.impressions)+'</td><td class="num">'+x.ctr.toFixed(2)+'%</td><td class="num">'+x.position.toFixed(1)+'</td><td class="num '+deltaClass(x.trend||0)+'">'+pct(x.trend||0)+'</td><td class="num '+deltaClass(x.positionChange||0)+'">'+signed(x.positionChange||0)+'</td></tr>').join('');
 }
 function escapeHtml(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}

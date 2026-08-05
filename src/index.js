@@ -11,6 +11,7 @@ export default {
         app: env.APP_NAME || 'CuratorOS Search Intelligence',
         site: env.GSC_SITE_URL || DEFAULT_SITE,
         configured: hasGoogleConfig(env),
+        integrations: integrationStatus(env),
         now: new Date().toISOString(),
       });
     }
@@ -46,6 +47,13 @@ function hasGoogleConfig(env) {
   return Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET && env.GOOGLE_REFRESH_TOKEN && (env.GSC_SITE_URL || DEFAULT_SITE));
 }
 
+function integrationStatus(env) {
+  return {
+    linkMap: Boolean(env.LINK_MAP_API_URL),
+    siteHealth: Boolean(env.SITE_HEALTH_API_URL),
+  };
+}
+
 function clampDays(days) {
   if (![7, 28, 90].includes(days)) return 28;
   return days;
@@ -56,7 +64,7 @@ async function buildLivePayload(env, days) {
   const siteUrl = env.GSC_SITE_URL || DEFAULT_SITE;
   const ranges = comparisonRanges(days);
 
-  const [current, previous] = await Promise.all([
+  const [current, previous, curatorContext] = await Promise.all([
     querySearchConsole(accessToken, siteUrl, {
       startDate: ranges.current.startDate,
       endDate: ranges.current.endDate,
@@ -73,6 +81,7 @@ async function buildLivePayload(env, days) {
       rowLimit: 25000,
       dataState: 'final',
     }),
+    fetchCuratorContext(env),
   ]);
 
   const currentRows = current.rows || [];
@@ -90,7 +99,7 @@ async function buildLivePayload(env, days) {
     top20: buckets.top20 - previousBuckets.top20,
     top50: buckets.top50 - previousBuckets.top50,
   };
-  const recommendations = buildRecommendations(queries);
+  const recommendations = enrichWithCuratorContext(buildRecommendations(queries), curatorContext);
   const today = buildTodayQueue(recommendations);
   const movers = buildMovers(queries, pages);
 
@@ -111,6 +120,7 @@ async function buildLivePayload(env, days) {
     movers,
     queries: queries.slice(0, 100),
     pages,
+    curatorContext: curatorContext.summary,
   };
 }
 
@@ -152,6 +162,120 @@ async function querySearchConsole(accessToken, siteUrl, body) {
     throw new Error(message);
   }
   return data;
+}
+
+async function fetchCuratorContext(env) {
+  const [linkMap, siteHealth] = await Promise.all([
+    fetchOptionalJson(env.LINK_MAP_API_URL, 'link-map'),
+    fetchOptionalJson(env.SITE_HEALTH_API_URL, 'site-health'),
+  ]);
+
+  return {
+    linkMap: normalizeLinkMap(linkMap.data),
+    siteHealth: normalizeSiteHealth(siteHealth.data),
+    summary: {
+      linkMap: { configured: Boolean(env.LINK_MAP_API_URL), ok: linkMap.ok, error: linkMap.error || null },
+      siteHealth: { configured: Boolean(env.SITE_HEALTH_API_URL), ok: siteHealth.ok, error: siteHealth.error || null },
+    },
+  };
+}
+
+async function fetchOptionalJson(url, label) {
+  if (!url) return { ok: false, skipped: true, data: null };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3500);
+  try {
+    const response = await fetch(url, {
+      headers: { accept: 'application/json', 'user-agent': 'CuratorOS-Search-Intelligence/1.0' },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`${label} returned HTTP ${response.status}`);
+    return { ok: true, data: await response.json() };
+  } catch (error) {
+    return { ok: false, data: null, error: error.name === 'AbortError' ? `${label} timed out` : error.message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function normalizeLinkMap(data) {
+  const byPage = new Map();
+  if (!data) return byPage;
+  const pages = Array.isArray(data.pages) ? data.pages : Array.isArray(data.nodes) ? data.nodes : [];
+  for (const item of pages) {
+    const path = normalizePage(item.path || item.url || item.id || '');
+    if (!path) continue;
+    byPage.set(path, {
+      inboundCount: Number(item.inboundCount ?? item.inbound ?? item.inDegree ?? 0),
+      outboundCount: Number(item.outboundCount ?? item.outbound ?? item.outDegree ?? 0),
+      orphan: Boolean(item.orphan || item.isOrphan),
+      suggestions: normalizeLinkSuggestions(item.suggestions || item.recommendedLinks || item.linkOpportunities || []),
+    });
+  }
+  return byPage;
+}
+
+function normalizeLinkSuggestions(values) {
+  if (!Array.isArray(values)) return [];
+  return values.slice(0, 8).map(item => typeof item === 'string'
+    ? { from: normalizePage(item), anchor: null }
+    : { from: normalizePage(item.from || item.source || item.path || item.url || ''), anchor: item.anchor || item.anchorText || null })
+    .filter(x => x.from);
+}
+
+function normalizeSiteHealth(data) {
+  const byPage = new Map();
+  if (!data) return byPage;
+  const pages = Array.isArray(data.pages) ? data.pages : Array.isArray(data.results) ? data.results : [];
+  for (const item of pages) {
+    const path = normalizePage(item.path || item.url || item.canonical || '');
+    if (!path) continue;
+    const issues = item.issues || item.errors || item.warnings || [];
+    byPage.set(path, {
+      ok: item.ok !== false && item.status !== 'error' && !item.critical,
+      httpStatus: Number(item.httpStatus || item.statusCode || 0) || null,
+      canonicalOk: item.canonicalOk !== false && item.canonicalMismatch !== true,
+      indexable: item.indexable !== false && item.noindex !== true,
+      issueCount: Array.isArray(issues) ? issues.length : Number(item.issueCount || 0),
+      issues: Array.isArray(issues) ? issues.slice(0, 8).map(String) : [],
+    });
+  }
+  return byPage;
+}
+
+function enrichWithCuratorContext(recommendations, context) {
+  return recommendations.map(rec => {
+    const link = context.linkMap.get(rec.page);
+    const health = context.siteHealth.get(rec.page);
+    const evidence = [...(rec.evidence || [])];
+    let action = rec.action;
+    let priorityScore = rec.priorityScore;
+    let confidence = rec.confidence;
+    const contextSignals = {};
+
+    if (link) {
+      contextSignals.linkMap = link;
+      evidence.push(`Internal links: ${link.inboundCount} inbound / ${link.outboundCount} outbound${link.orphan ? ' · orphan risk' : ''}`);
+      if ((rec.type === 'strengthen' || rec.type === 'emerging' || rec.type === 'decline') && (link.inboundCount < 4 || link.orphan)) {
+        priorityScore = Math.min(100, priorityScore + 8);
+        action = link.suggestions.length
+          ? `Strengthen internal support first. Suggested linking pages: ${link.suggestions.slice(0, 4).map(x => x.from).join(', ')}.`
+          : 'Strengthen internal support first; this page has weak inbound linking relative to its search opportunity.';
+      }
+    }
+
+    if (health) {
+      contextSignals.siteHealth = health;
+      evidence.push(`Site Health: ${health.ok ? 'healthy' : 'attention needed'}${health.issueCount ? ` · ${health.issueCount} issue(s)` : ''}`);
+      if (!health.ok || !health.canonicalOk || !health.indexable || (health.httpStatus && health.httpStatus >= 400)) {
+        priorityScore = Math.min(100, priorityScore + 10);
+        confidence = confidence === 'low' ? 'medium' : confidence;
+        action = 'Fix the Site Health blocker before changing content. Reassess ranking performance after the technical issue is resolved.';
+      }
+    }
+
+    return { ...rec, priorityScore, confidence, action, evidence, context: contextSignals };
+  }).sort((a, b) => b.priorityScore - a.priorityScore || b.impressions - a.impressions);
 }
 
 function comparisonRanges(days) {
@@ -488,7 +612,8 @@ function demoPayload() {
     pages: [
       { path: '/ships/rms-olympic', clicks: 451, impressions: 8240, ctr: 5.47, position: 7.2, trend: 18.4, clicksChange: 12.1, ctrChange: 0.3, positionChange: 1.2, previous: { clicks: 402, impressions: 6959, ctr: 5.78, position: 8.4 } },
       { path: '/how-long-did-it-take-titanic-to-sink', clicks: 682, impressions: 11320, ctr: 6.02, position: 3.7, trend: 4.1, clicksChange: 5.8, ctrChange: 0.1, positionChange: 0.2, previous: { clicks: 645, impressions: 10874, ctr: 5.93, position: 3.9 } },
-    ]
+    ],
+    curatorContext: { linkMap: { configured: false, ok: false }, siteHealth: { configured: false, ok: false } },
   };
 }
 
@@ -502,9 +627,9 @@ function renderApp() {
 <meta name="description" content="CuratorOS search performance and SEO opportunity intelligence for oceanliners.net.">
 <style>
 :root{--bg:#07100f;--ink:#f3eee3;--muted:#b7b2a7;--brass:#bfa46a;--line:rgba(191,164,106,.28);--good:#93c59e;--bad:#d98b83;--shadow:0 18px 50px rgba(0,0,0,.3)}
-*{box-sizing:border-box}html{background:var(--bg);color:var(--ink);font-family:Georgia,'Times New Roman',serif}body{margin:0;min-height:100vh;background:radial-gradient(circle at 50% 0,rgba(191,164,106,.08),transparent 32rem),linear-gradient(180deg,#091310,#07100f)}.shell{max-width:1480px;margin:auto;padding:24px}.topbar{display:flex;gap:18px;align-items:center;justify-content:space-between;padding:10px 0 24px;border-bottom:1px solid var(--line)}.brand{display:flex;gap:14px;align-items:center}.mark{width:42px;height:42px;border:1px solid var(--brass);display:grid;place-items:center;font-weight:bold;color:var(--brass);transform:rotate(45deg)}.mark span{transform:rotate(-45deg)}.brand small,.eyebrow{display:block;color:var(--brass);text-transform:uppercase;letter-spacing:.18em;font:700 11px/1.4 system-ui,sans-serif}.brand strong{font-size:21px}.controls{display:flex;gap:9px;flex-wrap:wrap}.btn,.select{border:1px solid var(--line);background:#0a1412;color:var(--ink);border-radius:999px;padding:9px 13px;font:600 13px system-ui,sans-serif}.btn{cursor:pointer}.hero{display:grid;grid-template-columns:1.3fr .7fr;gap:18px;padding:32px 0 18px}.hero h1{font-size:clamp(34px,5vw,66px);line-height:.98;margin:8px 0 14px;max-width:900px}.hero p{color:var(--muted);font-size:17px;line-height:1.65;max-width:770px}.status,.card{border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.025),rgba(255,255,255,.012));border-radius:18px;padding:18px;box-shadow:var(--shadow)}.status{align-self:end}.status strong{font:700 13px system-ui,sans-serif}.status p{font-size:13px;margin:7px 0 0}.grid{display:grid;gap:14px}.metrics{grid-template-columns:repeat(4,1fr);margin:12px 0 22px}.metric span{color:var(--muted);font:600 12px system-ui,sans-serif;text-transform:uppercase;letter-spacing:.08em}.metric strong{display:block;font-size:34px;margin-top:10px}.metric em{font:600 12px system-ui,sans-serif;font-style:normal}.good{color:var(--good)}.bad{color:var(--bad)}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin:30px 0 12px}.section-head h2{font-size:25px;margin:0}.section-head p{font:13px system-ui,sans-serif;color:var(--muted);margin:0}.layout{grid-template-columns:1.05fr .95fr}.rec{display:grid;grid-template-columns:auto 1fr auto;gap:14px;padding:15px 0;border-bottom:1px solid rgba(191,164,106,.16)}.badge{width:38px;height:38px;border:1px solid var(--line);border-radius:11px;display:grid;place-items:center;font:800 13px system-ui,sans-serif;color:var(--brass)}.rec h3{font:700 15px system-ui,sans-serif;margin:0 0 5px}.rec p{font:13px/1.5 system-ui,sans-serif;color:var(--muted);margin:0}.rec .stat{text-align:right;font:700 13px system-ui,sans-serif}.rec .stat small{display:block;color:var(--muted);font-weight:500;margin-top:4px}.bucket-grid{grid-template-columns:repeat(2,1fr);margin-top:14px}.bucket strong{display:block;font-size:28px}.bucket span{font:12px system-ui,sans-serif;color:var(--muted)}.today-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.action-card{border:1px solid var(--line);background:linear-gradient(180deg,rgba(191,164,106,.055),rgba(255,255,255,.015));border-radius:16px;padding:16px}.action-top{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}.action-rank{font:800 12px system-ui,sans-serif;color:var(--brass);letter-spacing:.08em;text-transform:uppercase}.score{font:800 18px system-ui,sans-serif}.meta{display:flex;gap:7px;flex-wrap:wrap;margin:10px 0}.pill{border:1px solid var(--line);border-radius:999px;padding:5px 8px;font:700 10px system-ui,sans-serif;text-transform:uppercase;letter-spacing:.06em}.action-card h3{font:700 17px system-ui,sans-serif;margin:4px 0 6px}.action-card p{font:13px/1.5 system-ui,sans-serif;color:var(--muted);margin:0 0 10px}.action-next{border-top:1px solid rgba(191,164,106,.16);padding-top:10px;color:var(--ink)!important}.evidence{margin:8px 0 0;padding-left:16px;color:var(--muted);font:12px/1.5 system-ui,sans-serif}table{width:100%;border-collapse:collapse;font:13px system-ui,sans-serif}th{text-align:left;color:var(--brass);font-size:11px;letter-spacing:.08em;text-transform:uppercase;padding:10px 8px;border-bottom:1px solid var(--line)}td{padding:13px 8px;border-bottom:1px solid rgba(191,164,106,.12)}td.num{text-align:right;font-variant-numeric:tabular-nums}.tabs{display:flex;gap:8px;margin:4px 0 16px;overflow:auto}.tab{white-space:nowrap;border:1px solid var(--line);border-radius:999px;padding:8px 12px;font:600 12px system-ui,sans-serif;background:transparent;color:var(--muted)}.tab.active{background:rgba(191,164,106,.12);color:var(--ink);border-color:var(--brass)}.foot{padding:28px 0 10px;color:var(--muted);font:12px/1.6 system-ui,sans-serif}
-@media(max-width:900px){.hero,.layout{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}.today-grid{grid-template-columns:1fr}.hero{padding-top:24px}.shell{padding:16px}.topbar{align-items:flex-start}.controls{justify-content:flex-end}.status{align-self:auto}}
-@media(max-width:560px){.metrics{grid-template-columns:1fr 1fr}.metric strong{font-size:27px}.brand strong{font-size:17px}.mark{width:36px;height:36px}.controls .btn:not(.primary){display:none}.rec{grid-template-columns:auto 1fr}.rec .stat{grid-column:2;text-align:left}.hero h1{font-size:40px}}
+*{box-sizing:border-box}html{background:var(--bg);color:var(--ink);font-family:Georgia,'Times New Roman',serif}body{margin:0;min-height:100vh;background:radial-gradient(circle at 50% 0,rgba(191,164,106,.08),transparent 32rem),linear-gradient(180deg,#091310,#07100f)}.shell{max-width:1480px;margin:auto;padding:24px}.topbar{display:flex;gap:18px;align-items:center;justify-content:space-between;padding:10px 0 24px;border-bottom:1px solid var(--line)}.brand{display:flex;gap:14px;align-items:center}.mark{width:42px;height:42px;border:1px solid var(--brass);display:grid;place-items:center;font-weight:bold;color:var(--brass);transform:rotate(45deg)}.mark span{transform:rotate(-45deg)}.brand small,.eyebrow{display:block;color:var(--brass);text-transform:uppercase;letter-spacing:.18em;font:700 11px/1.4 system-ui,sans-serif}.brand strong{font-size:21px}.controls{display:flex;gap:9px;flex-wrap:wrap}.btn,.select{border:1px solid var(--line);background:#0a1412;color:var(--ink);border-radius:999px;padding:9px 13px;font:600 13px system-ui,sans-serif}.btn{cursor:pointer}.hero{display:grid;grid-template-columns:1.3fr .7fr;gap:18px;padding:32px 0 18px}.hero h1{font-size:clamp(34px,5vw,66px);line-height:.98;margin:8px 0 14px;max-width:900px}.hero p{color:var(--muted);font-size:17px;line-height:1.65;max-width:770px}.status,.card{border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.025),rgba(255,255,255,.012));border-radius:18px;padding:18px;box-shadow:var(--shadow)}.status{align-self:end}.status strong{font:700 13px system-ui,sans-serif}.status p{font-size:13px;margin:7px 0 0}.grid{display:grid;gap:14px}.metrics{grid-template-columns:repeat(4,1fr);margin:12px 0 22px}.metric span{color:var(--muted);font:600 12px system-ui,sans-serif;text-transform:uppercase;letter-spacing:.08em}.metric strong{display:block;font-size:34px;margin-top:10px}.metric em{font:600 12px system-ui,sans-serif;font-style:normal}.good{color:var(--good)}.bad{color:var(--bad)}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin:30px 0 12px}.section-head h2{font-size:25px;margin:0}.section-head p{font:13px system-ui,sans-serif;color:var(--muted);margin:0}.layout{grid-template-columns:1.05fr .95fr}.today-list{display:grid;gap:12px}.today-item{border:1px solid rgba(191,164,106,.2);border-radius:14px;padding:15px;background:rgba(191,164,106,.035)}.today-top{display:flex;justify-content:space-between;gap:14px}.today-item h3{margin:0;font:700 15px system-ui,sans-serif}.today-item p{margin:7px 0 0;color:var(--muted);font:13px/1.5 system-ui,sans-serif}.pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:4px 8px;margin:7px 5px 0 0;font:700 10px system-ui,sans-serif;text-transform:uppercase;letter-spacing:.06em}.action{margin-top:10px;padding-top:10px;border-top:1px solid rgba(191,164,106,.12);color:var(--ink)!important}.rec{display:grid;grid-template-columns:auto 1fr auto;gap:14px;padding:15px 0;border-bottom:1px solid rgba(191,164,106,.16)}.badge{width:38px;height:38px;border:1px solid var(--line);border-radius:11px;display:grid;place-items:center;font:800 13px system-ui,sans-serif;color:var(--brass)}.rec h3{font:700 15px system-ui,sans-serif;margin:0 0 5px}.rec p{font:13px/1.5 system-ui,sans-serif;color:var(--muted);margin:0}.rec .stat{text-align:right;font:700 13px system-ui,sans-serif}.rec .stat small{display:block;color:var(--muted);font-weight:500;margin-top:4px}.bucket-grid{grid-template-columns:repeat(2,1fr);margin-top:14px}.bucket strong{display:block;font-size:28px}.bucket span{font:12px system-ui,sans-serif;color:var(--muted)}table{width:100%;border-collapse:collapse;font:13px system-ui,sans-serif}th{text-align:left;color:var(--brass);font-size:11px;letter-spacing:.08em;text-transform:uppercase;padding:10px 8px;border-bottom:1px solid var(--line)}td{padding:13px 8px;border-bottom:1px solid rgba(191,164,106,.12)}td.num{text-align:right;font-variant-numeric:tabular-nums}.tabs{display:flex;gap:8px;margin:4px 0 16px;overflow:auto}.tab{white-space:nowrap;border:1px solid var(--line);border-radius:999px;padding:8px 12px;font:600 12px system-ui,sans-serif;background:transparent;color:var(--muted)}.tab.active{background:rgba(191,164,106,.12);color:var(--ink);border-color:var(--brass)}.foot{padding:28px 0 10px;color:var(--muted);font:12px/1.6 system-ui,sans-serif}
+@media(max-width:900px){.hero,.layout{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}.hero{padding-top:24px}.shell{padding:16px}.topbar{align-items:flex-start}.controls{justify-content:flex-end}.status{align-self:auto}}
+@media(max-width:560px){.metrics{grid-template-columns:1fr 1fr}.metric strong{font-size:27px}.brand strong{font-size:17px}.mark{width:36px;height:36px}.controls .btn:not(.primary){display:none}.rec{grid-template-columns:auto 1fr}.rec .stat{grid-column:2;text-align:left}.hero h1{font-size:40px}.today-top{display:block}}
 </style>
 </head>
 <body>
@@ -514,8 +639,8 @@ function renderApp() {
   <div class="controls"><select class="select" id="period"><option value="28">28 days</option><option value="7">7 days</option><option value="90">90 days</option></select><button class="btn" id="refresh">Refresh</button></div>
 </header>
 <section class="hero">
- <div><span class="eyebrow">Oceanliners.net · Organic Search</span><h1>What is Google telling us to do next?</h1><p>Search Intelligence compares each period against the immediately preceding equal-length period so CuratorOS can distinguish stable winners from genuine movement.</p></div>
- <aside class="status"><span class="eyebrow">Data status</span><strong id="dataStatus">Loading Search Console…</strong><p id="statusText">Reading live Google Search Console data.</p></aside>
+ <div><span class="eyebrow">Oceanliners.net · Organic Search</span><h1>What is Google telling us to do next?</h1><p>Search Intelligence combines Google movement with CuratorOS context so the system can distinguish technical blockers, weak internal support, stable winners, and genuine editorial opportunities.</p></div>
+ <aside class="status"><span class="eyebrow">Data status</span><strong id="dataStatus">Loading Search Console…</strong><p id="statusText">Reading live Google Search Console data.</p><p id="integrationText"></p></aside>
 </section>
 <div class="grid metrics">
  <div class="card metric"><span>Google clicks</span><strong id="clicks">—</strong><em id="clicksDelta">—</em></div>
@@ -523,17 +648,14 @@ function renderApp() {
  <div class="card metric"><span>CTR</span><strong id="ctr">—</strong><em id="ctrDelta">—</em></div>
  <div class="card metric"><span>Average position</span><strong id="position">—</strong><em id="positionDelta">—</em></div>
 </div>
+<section><div class="section-head"><div><span class="eyebrow">Today</span><h2>Highest-value actions</h2></div><p>CuratorOS keeps this queue intentionally small.</p></div><div class="card today-list" id="today"></div></section>
 <div class="tabs"><button class="tab active">Overview</button><button class="tab">Opportunities</button><button class="tab">Pages</button><button class="tab">Queries</button><button class="tab">Index Monitor</button><button class="tab">Technical</button></div>
-<section>
-  <div class="section-head"><div><span class="eyebrow">Today</span><h2>Highest-value actions</h2></div><p>Short queue · evidence-weighted</p></div>
-  <div class="today-grid" id="today"></div>
-</section>
 <div class="grid layout">
 <section class="card"><div class="section-head"><div><span class="eyebrow">Decision engine</span><h2>What should I work on?</h2></div><p>Period-over-period priorities</p></div><div id="recommendations"></div></section>
 <section class="card"><div class="section-head"><div><span class="eyebrow">Ranking footprint</span><h2>Where the site appears</h2></div><p>Current query buckets</p></div><div class="grid bucket-grid" id="buckets"></div></section>
 </div>
 <section><div class="section-head"><div><span class="eyebrow">Page intelligence</span><h2>Pages gaining and losing visibility</h2></div><p>Compared with the immediately preceding period.</p></div><div class="card" style="overflow:auto"><table><thead><tr><th>Page</th><th style="text-align:right">Clicks</th><th style="text-align:right">Impressions</th><th style="text-align:right">CTR</th><th style="text-align:right">Position</th><th style="text-align:right">Visibility</th><th style="text-align:right">Rank Δ</th></tr></thead><tbody id="pages"></tbody></table></div></section>
-<footer class="foot">CuratorOS Search Intelligence · Built for oceanliners.net. Prioritize high-confidence changes; protect stable winners.</footer>
+<footer class="foot">CuratorOS Search Intelligence · Built for oceanliners.net. Search data informs the decision; CuratorOS context determines the action.</footer>
 </div>
 <script>
 const fmt=n=>new Intl.NumberFormat().format(Math.round(n||0));
@@ -554,6 +676,8 @@ async function load(){
     document.querySelector('#dataStatus').textContent='Demo dataset active';
     document.querySelector('#statusText').textContent='Live Search Console data could not be loaded: '+error.message;
   }
+  const cx=d.curatorContext||{};
+  document.querySelector('#integrationText').textContent='CuratorOS context · Link Map: '+integrationLabel(cx.linkMap)+' · Site Health: '+integrationLabel(cx.siteHealth);
   document.querySelector('#clicks').textContent=fmt(d.metrics.clicks);
   document.querySelector('#impressions').textContent=fmt(d.metrics.impressions);
   document.querySelector('#ctr').textContent=d.metrics.ctr.toFixed(2)+'%';
@@ -563,13 +687,15 @@ async function load(){
   document.querySelector('#impressionsDelta').textContent=pct(c.impressions||0)+' vs prior period';document.querySelector('#impressionsDelta').className=deltaClass(c.impressions||0);
   document.querySelector('#ctrDelta').textContent=signed(c.ctr||0)+' pts vs prior period';document.querySelector('#ctrDelta').className=deltaClass(c.ctr||0);
   document.querySelector('#positionDelta').textContent=signed(c.position||0)+' places vs prior period';document.querySelector('#positionDelta').className=deltaClass(c.position||0);
+  const today=d.today||[];
+  document.querySelector('#today').innerHTML=today.length?today.map(x=>'<article class="today-item"><div class="today-top"><div><span class="eyebrow">#'+x.rank+' · Priority '+x.priorityScore+'</span><h3>'+escapeHtml(x.title)+'</h3></div><div><span class="pill">'+escapeHtml(x.confidence)+' confidence</span><span class="pill">'+escapeHtml(x.expectedUpside)+' upside</span></div></div><p><strong>'+escapeHtml(x.query)+'</strong> · '+escapeHtml(x.page)+'</p><p>'+escapeHtml((x.evidence||[]).join(' · '))+'</p><p class="action"><strong>Next:</strong> '+escapeHtml(x.action)+'</p></article>').join(''):'<p style="color:var(--muted);font:14px system-ui,sans-serif">No high-value actions need attention in this period.</p>';
   const bd=d.bucketDelta||{};
   document.querySelector('#buckets').innerHTML=[['Top 3',d.buckets.top3,bd.top3],['Top 10',d.buckets.top10,bd.top10],['Top 20',d.buckets.top20,bd.top20],['Top 50',d.buckets.top50,bd.top50]].map(x=>'<div class="bucket"><strong>'+fmt(x[1])+'</strong><span>queries in '+x[0]+' · <b class="'+deltaClass(x[2]||0)+'">'+signed(x[2]||0)+'</b></span></div>').join('');
   const icon={strengthen:'↑',protect:'◆',ctr:'↗',leave:'✓',decline:'↓',breakthrough:'★',emerging:'+'};
-  document.querySelector('#today').innerHTML=(d.today||[]).map(x=>'<article class="action-card"><div class="action-top"><div><div class="action-rank">Priority '+x.rank+'</div><h3>'+escapeHtml(x.title)+'</h3></div><div class="score">'+fmt(x.priorityScore)+'</div></div><p><strong>'+escapeHtml(x.query)+'</strong><br>'+escapeHtml(x.page)+'</p><div class="meta"><span class="pill">'+escapeHtml(x.confidence)+' confidence</span><span class="pill">'+escapeHtml(x.expectedUpside)+' upside</span><span class="pill">#'+(x.position||0).toFixed(1)+'</span></div><p>'+escapeHtml(x.rationale)+'</p><ul class="evidence">'+(x.evidence||[]).slice(0,3).map(e=>'<li>'+escapeHtml(e)+'</li>').join('')+'</ul><p class="action-next"><strong>Next:</strong> '+escapeHtml(x.action)+'</p></article>').join('')||'<div class="card"><p style="color:var(--muted);font:14px system-ui,sans-serif">No high-confidence actions are demanding attention in this period.</p></div>';
-  document.querySelector('#recommendations').innerHTML=(d.recommendations||[]).map(x=>'<article class="rec"><div class="badge">'+(icon[x.type]||'•')+'</div><div><h3>'+x.title+'</h3><p><strong>'+escapeHtml(x.query)+'</strong> · '+escapeHtml(x.page)+'<br>'+escapeHtml(x.rationale)+'<br><b>Action:</b> '+escapeHtml(x.action)+'</p></div><div class="stat">'+fmt(x.priorityScore)+'/100<small>'+escapeHtml(x.confidence)+' confidence</small></div></article>').join('')||'<p style="color:var(--muted);font:14px system-ui,sans-serif">No high-confidence recommendations in this period.</p>';
+  document.querySelector('#recommendations').innerHTML=(d.recommendations||[]).map(x=>'<article class="rec"><div class="badge">'+(icon[x.type]||'•')+'</div><div><h3>'+escapeHtml(x.title)+'</h3><p><strong>'+escapeHtml(x.query)+'</strong> · '+escapeHtml(x.page)+'<br>'+escapeHtml(x.rationale)+'<br><strong>Action:</strong> '+escapeHtml(x.action)+'</p></div><div class="stat">'+x.priorityScore+'/100<small>#'+(x.position||0).toFixed(1)+' · '+fmt(x.impressions)+' impr.</small></div></article>').join('')||'<p style="color:var(--muted);font:14px system-ui,sans-serif">No high-confidence recommendations in this period.</p>';
   document.querySelector('#pages').innerHTML=(d.pages||[]).slice(0,50).map(x=>'<tr><td>'+escapeHtml(x.path)+'</td><td class="num">'+fmt(x.clicks)+'</td><td class="num">'+fmt(x.impressions)+'</td><td class="num">'+x.ctr.toFixed(2)+'%</td><td class="num">'+x.position.toFixed(1)+'</td><td class="num '+deltaClass(x.trend||0)+'">'+pct(x.trend||0)+'</td><td class="num '+deltaClass(x.positionChange||0)+'">'+signed(x.positionChange||0)+'</td></tr>').join('');
 }
+function integrationLabel(x){if(!x||!x.configured)return 'not configured';return x.ok?'connected':'unavailable';}
 function escapeHtml(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 document.querySelector('#refresh').addEventListener('click',load);document.querySelector('#period').addEventListener('change',load);load();
 </script>

@@ -1,5 +1,5 @@
 name = "search-intelligence"
-main = "src/index.js"
+main = "src/entry.js"
 compatibility_date = "2026-08-01"
 
 [vars]
@@ -9,10 +9,9 @@ LINK_MAP_API_URL = "https://link-map.oceanliners.net/api/search-intelligence"
 SITE_HEALTH_API_URL = "https://site-health.oceanliners.net/api/search-intelligence"
 
 # CuratorOS context integrations are intentionally read-only from Search Intelligence.
-# Link Map publishes its graph snapshot to LINK_MAP_CACHE; Site Health publishes its
-# technical snapshot to SITE_HEALTH_INTEGRATION_CACHE. Search Intelligence consumes
-# only the public integration payloads above and continues normally if either sibling
-# service is temporarily unavailable.
+# Link Map supplies the graph snapshot. Site Health is queried on demand only for the
+# small set of pages in the active recommendation queue, avoiding full-site subrequest
+# limits while keeping technical checks fresh.
 
 # Optional bindings for later phases:
 # [[kv_namespaces]]

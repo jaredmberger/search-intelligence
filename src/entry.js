@@ -1,12 +1,14 @@
 import core from './index.js';
 import { enhanceWorkspaceUI } from './workspaces.js';
 import { enhanceDossierUI } from './dossiers.js';
+import { handleUrlInspection } from './url-inspection.js';
 
 const MAX_HEALTH_PAGES = 12;
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    if (url.pathname === '/api/url-inspection') return handleUrlInspection(request, env);
     if (url.pathname === '/api/integration-debug-site-health') {
       if (!env.SITE_HEALTH_API_URL) return json({ ok: false, error: 'SITE_HEALTH_API_URL is not configured.' }, 503);
       const health = await fetchHealthBatch(env.SITE_HEALTH_API_URL, ['/']);

@@ -1,6 +1,7 @@
 import core from './index.js';
 import { enhanceWorkspaceUI } from './workspaces.js';
 import { enhanceDossierUI } from './dossiers.js';
+import { enhanceIndexMonitorUI } from './index-monitor.js';
 import { handleUrlInspection } from './url-inspection.js';
 
 const MAX_HEALTH_PAGES = 12;
@@ -18,7 +19,8 @@ export default {
     const response = await core.fetch(request, env, ctx);
     if (url.pathname === '/' && response.ok && (response.headers.get('content-type') || '').includes('text/html')) {
       const html = await response.text();
-      return new Response(enhanceDossierUI(enhanceWorkspaceUI(html)), { status: response.status, headers: response.headers });
+      const enhanced = enhanceIndexMonitorUI(enhanceDossierUI(enhanceWorkspaceUI(html)));
+      return new Response(enhanced, { status: response.status, headers: response.headers });
     }
     return response;
   },

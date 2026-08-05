@@ -5,6 +5,19 @@ const MAX_HEALTH_PAGES = 12;
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    if (url.pathname === '/api/integration-debug-site-health') {
+      if (!env.SITE_HEALTH_API_URL) return json({ ok: false, error: 'SITE_HEALTH_API_URL is not configured.' }, 503);
+      const health = await fetchHealthBatch(env.SITE_HEALTH_API_URL, ['/']);
+      return json({
+        ok: health.ok,
+        configuredUrl: env.SITE_HEALTH_API_URL,
+        resolvedEndpoint: `${String(env.SITE_HEALTH_API_URL).replace(/\/$/, '')}/check`,
+        error: health.error || null,
+        data: health.data || null,
+      }, health.ok ? 200 : 502);
+    }
+
     if (url.pathname !== '/api/search') return core.fetch(request, env, ctx);
 
     const response = await core.fetch(request, env, ctx);
@@ -70,7 +83,10 @@ async function fetchHealthBatch(baseUrl, pages) {
       body: JSON.stringify({ pages }),
       signal: controller.signal,
     });
-    const data = await response.json();
+    const text = await response.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; }
+    catch { throw new Error(`site-health returned non-JSON HTTP ${response.status}: ${text.slice(0, 180)}`); }
     if (!response.ok || data?.ok === false) throw new Error(data?.error || `site-health returned HTTP ${response.status}`);
     return { ok: true, data };
   } catch (error) {

@@ -1,4 +1,6 @@
 const SNAP='snapshot:';
+const LATEST='watchtower:latest';
+const INDEX='watchtower:index';
 const KEEP_DAYS=210;
 
 export async function captureWatchtowerSnapshot(env){
@@ -9,7 +11,11 @@ export async function captureWatchtowerSnapshot(env){
   const data=await query(token,site,body);const rows=data.rows||[];const pages=summarizePages(rows).slice(0,300);const queries=summarizeQueries(rows).slice(0,500);
   const date=ymd(new Date());const snapshot={date,capturedAt:new Date().toISOString(),range:{startDate:ymd(start),endDate:ymd(end)},pages,queries,totals:summarize(rows)};
   const previous=await latestSnapshot(env,date);const events=previous?detectChanges(previous,snapshot):[];snapshot.events=events;
-  await env.SEARCH_INTELLIGENCE_RECORDS.put(SNAP+date,JSON.stringify(snapshot));await prune(env);
+  const index=await readIndex(env);const nextDates=[date,...index.filter(d=>d!==date)].sort().reverse();
+  await env.SEARCH_INTELLIGENCE_RECORDS.put(SNAP+date,JSON.stringify(snapshot));
+  await env.SEARCH_INTELLIGENCE_RECORDS.put(LATEST,JSON.stringify({date,capturedAt:snapshot.capturedAt}));
+  await env.SEARCH_INTELLIGENCE_RECORDS.put(INDEX,JSON.stringify(nextDates.slice(0,KEEP_DAYS+15)));
+  await pruneFromIndex(env,nextDates);
   return {ok:true,date,previousDate:previous?.date||null,eventCount:events.length,events,snapshot};
 }
 
@@ -19,11 +25,14 @@ export async function handleWatchtower(request,env){
   if(request.method==='POST'&&url.searchParams.get('action')==='capture'){
     try{return json(await captureWatchtowerSnapshot(env))}catch(e){return json({ok:false,error:e.message||String(e)},502)}
   }
-  const list=await env.SEARCH_INTELLIGENCE_RECORDS.list({prefix:SNAP,limit:100});const dates=list.keys.map(k=>k.name.slice(SNAP.length)).sort().reverse();
-  const snapshots=[];for(const date of dates.slice(0,35)){const s=await env.SEARCH_INTELLIGENCE_RECORDS.get(SNAP+date,'json');if(s)snapshots.push(s)}
-  const latest=snapshots[0]||null;const events=[];for(const s of snapshots.slice(0,14))for(const e of s.events||[])events.push({...e,snapshotDate:s.date});
+  const dates=await readIndex(env);const snapshots=[];
+  for(const date of dates.slice(0,35)){const s=await env.SEARCH_INTELLIGENCE_RECORDS.get(SNAP+date,'json');if(s)snapshots.push(s)}
+  let latest=snapshots[0]||null;
+  if(!latest){const pointer=await env.SEARCH_INTELLIGENCE_RECORDS.get(LATEST,'json');if(pointer?.date)latest=await env.SEARCH_INTELLIGENCE_RECORDS.get(SNAP+pointer.date,'json')}
+  const events=[];for(const s of snapshots.slice(0,14))for(const e of s.events||[])events.push({...e,snapshotDate:s.date});
+  if(latest&&!snapshots.some(s=>s.date===latest.date))for(const e of latest.events||[])events.push({...e,snapshotDate:latest.date});
   events.sort((a,b)=>(b.score||0)-(a.score||0)||String(b.snapshotDate).localeCompare(String(a.snapshotDate)));
-  return json({ok:true,snapshotCount:dates.length,latestDate:latest?.date||null,latestRange:latest?.range||null,latestTotals:latest?.totals||null,events:events.slice(0,80),history:snapshots.map(s=>({date:s.date,totals:s.totals,eventCount:(s.events||[]).length}))});
+  return json({ok:true,snapshotCount:dates.length||(latest?1:0),latestDate:latest?.date||null,latestRange:latest?.range||null,latestTotals:latest?.totals||null,events:events.slice(0,80),history:snapshots.map(s=>({date:s.date,totals:s.totals,eventCount:(s.events||[]).length}))});
 }
 
 function detectChanges(prev,cur){const events=[];const pp=new Map((prev.pages||[]).map(x=>[x.path,x]));const pq=new Map((prev.queries||[]).map(x=>[x.query+'\n'+x.page,x]));
@@ -40,8 +49,9 @@ function ev(type,severity,score,subject,title,detail,page,query=''){return{type,
 function summarize(rows){let clicks=0,impressions=0,pos=0;for(const r of rows){clicks+=r.clicks||0;impressions+=r.impressions||0;pos+=(r.position||0)*(r.impressions||0)}return{clicks:Math.round(clicks),impressions:Math.round(impressions),ctr:impressions?clicks/impressions*100:0,position:impressions?pos/impressions:0}}
 function summarizePages(rows){const m=new Map();for(const r of rows){const page=pathOf(r.keys?.[1]||'');if(!page)continue;let x=m.get(page)||{path:page,clicks:0,impressions:0,pos:0};x.clicks+=r.clicks||0;x.impressions+=r.impressions||0;x.pos+=(r.position||0)*(r.impressions||0);m.set(page,x)}return [...m.values()].map(x=>({path:x.path,clicks:Math.round(x.clicks),impressions:Math.round(x.impressions),ctr:x.impressions?x.clicks/x.impressions*100:0,position:x.impressions?x.pos/x.impressions:0})).sort((a,b)=>b.impressions-a.impressions)}
 function summarizeQueries(rows){return rows.map(r=>({query:String(r.keys?.[0]||''),page:pathOf(r.keys?.[1]||''),clicks:Math.round(r.clicks||0),impressions:Math.round(r.impressions||0),ctr:(r.ctr||0)*100,position:r.position||0})).filter(x=>x.query&&x.page).sort((a,b)=>b.impressions-a.impressions)}
-async function latestSnapshot(env,before){const list=await env.SEARCH_INTELLIGENCE_RECORDS.list({prefix:SNAP,limit:100});const dates=list.keys.map(k=>k.name.slice(SNAP.length)).filter(d=>d<before).sort().reverse();return dates[0]?env.SEARCH_INTELLIGENCE_RECORDS.get(SNAP+dates[0],'json'):null}
-async function prune(env){const list=await env.SEARCH_INTELLIGENCE_RECORDS.list({prefix:SNAP,limit:1000});const cutoff=ymd(new Date(Date.now()-KEEP_DAYS*86400000));for(const k of list.keys){if(k.name.slice(SNAP.length)<cutoff)await env.SEARCH_INTELLIGENCE_RECORDS.delete(k.name)}}
+async function readIndex(env){const dates=await env.SEARCH_INTELLIGENCE_RECORDS.get(INDEX,'json');if(Array.isArray(dates)&&dates.length)return dates.filter(Boolean).sort().reverse();const list=await env.SEARCH_INTELLIGENCE_RECORDS.list({prefix:SNAP,limit:1000});const recovered=list.keys.map(k=>k.name.slice(SNAP.length)).filter(Boolean).sort().reverse();if(recovered.length)await env.SEARCH_INTELLIGENCE_RECORDS.put(INDEX,JSON.stringify(recovered));return recovered}
+async function latestSnapshot(env,before){const dates=(await readIndex(env)).filter(d=>d<before).sort().reverse();if(dates[0])return env.SEARCH_INTELLIGENCE_RECORDS.get(SNAP+dates[0],'json');const pointer=await env.SEARCH_INTELLIGENCE_RECORDS.get(LATEST,'json');if(pointer?.date&&pointer.date<before)return env.SEARCH_INTELLIGENCE_RECORDS.get(SNAP+pointer.date,'json');return null}
+async function pruneFromIndex(env,dates){const cutoff=ymd(new Date(Date.now()-KEEP_DAYS*86400000));const keep=[];for(const d of dates){if(d<cutoff)await env.SEARCH_INTELLIGENCE_RECORDS.delete(SNAP+d);else keep.push(d)}await env.SEARCH_INTELLIGENCE_RECORDS.put(INDEX,JSON.stringify(keep))}
 async function getAccessToken(env){if(!(env.GOOGLE_CLIENT_ID&&env.GOOGLE_CLIENT_SECRET&&env.GOOGLE_REFRESH_TOKEN))throw new Error('Google credentials are not configured.');const body=new URLSearchParams({client_id:env.GOOGLE_CLIENT_ID,client_secret:env.GOOGLE_CLIENT_SECRET,refresh_token:env.GOOGLE_REFRESH_TOKEN,grant_type:'refresh_token'});const r=await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body});const d=await r.json();if(!r.ok||!d.access_token)throw new Error(d.error_description||d.error||'Unable to refresh Google access token.');return d.access_token}
 async function query(token,site,body){const r=await fetch(`https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(site)}/searchAnalytics/query`,{method:'POST',headers:{authorization:`Bearer ${token}`,'content-type':'application/json'},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw new Error(d?.error?.message||'Search Console API request failed.');return d}
 function pathOf(v){try{let p=new URL(v,'https://oceanliners.net').pathname||'/';p=p.replace(/\/index\.html?$/i,'/').replace(/\.html?$/i,'');return p.length>1?p.replace(/\/$/,''):p}catch{return String(v||'')}}

@@ -25,6 +25,7 @@ export async function handleWatchtower(request,env){
   if(request.method==='POST'&&url.searchParams.get('action')==='capture'){
     try{return json(await captureWatchtowerSnapshot(env))}catch(e){return json({ok:false,error:e.message||String(e)},502)}
   }
+  if(url.searchParams.get('history')==='1')return handleHistory(url,env);
   const dates=await readIndex(env);const snapshots=[];
   for(const date of dates.slice(0,35)){const s=await env.SEARCH_INTELLIGENCE_RECORDS.get(SNAP+date,'json');if(s)snapshots.push(s)}
   let latest=snapshots[0]||null;
@@ -33,6 +34,19 @@ export async function handleWatchtower(request,env){
   if(latest&&!snapshots.some(s=>s.date===latest.date))for(const e of latest.events||[])events.push({...e,snapshotDate:latest.date});
   events.sort((a,b)=>(b.score||0)-(a.score||0)||String(b.snapshotDate).localeCompare(String(a.snapshotDate)));
   return json({ok:true,snapshotCount:dates.length||(latest?1:0),latestDate:latest?.date||null,latestRange:latest?.range||null,latestTotals:latest?.totals||null,events:events.slice(0,80),history:snapshots.map(s=>({date:s.date,totals:s.totals,eventCount:(s.events||[]).length}))});
+}
+
+async function handleHistory(url,env){
+  const page=normalizePath(url.searchParams.get('page')||'');const queryText=String(url.searchParams.get('query')||'').trim();const requested=Math.max(30,Math.min(210,Number(url.searchParams.get('days')||90)));
+  if(!page&&!queryText)return json({ok:false,error:'page or query is required.'},400);
+  const cutoff=ymd(new Date(Date.now()-requested*86400000));const dates=(await readIndex(env)).filter(d=>d>=cutoff).sort();const points=[];
+  for(const date of dates){const s=await env.SEARCH_INTELLIGENCE_RECORDS.get(SNAP+date,'json');if(!s)continue;let x=null;
+    if(queryText){const matches=(s.queries||[]).filter(q=>q.query===queryText&&(!page||q.page===page));if(matches.length){const impressions=matches.reduce((n,q)=>n+(q.impressions||0),0),clicks=matches.reduce((n,q)=>n+(q.clicks||0),0),pos=matches.reduce((n,q)=>n+(q.position||0)*(q.impressions||0),0);x={clicks,impressions,ctr:impressions?clicks/impressions*100:0,position:impressions?pos/impressions:0}}}
+    else x=(s.pages||[]).find(p=>p.path===page)||null;
+    if(x)points.push({date:s.date,capturedAt:s.capturedAt,clicks:x.clicks||0,impressions:x.impressions||0,ctr:x.ctr||0,position:x.position||0});
+  }
+  const milestones=[];for(let i=1;i<points.length;i++){const a=points[i-1],b=points[i];if(a.position>20&&b.position<=20)milestones.push({date:b.date,type:'top20',label:'Entered Top 20'});if(a.position>10&&b.position<=10)milestones.push({date:b.date,type:'top10',label:'Entered Top 10'});if(a.position>3&&b.position<=3)milestones.push({date:b.date,type:'top3',label:'Entered Top 3'});if(a.position<=10&&b.position>10)milestones.push({date:b.date,type:'left10',label:'Left Top 10'})}
+  return json({ok:true,kind:queryText?'query':'page',page:page||null,query:queryText||null,days:requested,pointCount:points.length,points,milestones});
 }
 
 function detectChanges(prev,cur){const events=[];const pp=new Map((prev.pages||[]).map(x=>[x.path,x]));const pq=new Map((prev.queries||[]).map(x=>[x.query+'\n'+x.page,x]));
@@ -54,5 +68,5 @@ async function latestSnapshot(env,before){const dates=(await readIndex(env)).fil
 async function pruneFromIndex(env,dates){const cutoff=ymd(new Date(Date.now()-KEEP_DAYS*86400000));const keep=[];for(const d of dates){if(d<cutoff)await env.SEARCH_INTELLIGENCE_RECORDS.delete(SNAP+d);else keep.push(d)}await env.SEARCH_INTELLIGENCE_RECORDS.put(INDEX,JSON.stringify(keep))}
 async function getAccessToken(env){if(!(env.GOOGLE_CLIENT_ID&&env.GOOGLE_CLIENT_SECRET&&env.GOOGLE_REFRESH_TOKEN))throw new Error('Google credentials are not configured.');const body=new URLSearchParams({client_id:env.GOOGLE_CLIENT_ID,client_secret:env.GOOGLE_CLIENT_SECRET,refresh_token:env.GOOGLE_REFRESH_TOKEN,grant_type:'refresh_token'});const r=await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body});const d=await r.json();if(!r.ok||!d.access_token)throw new Error(d.error_description||d.error||'Unable to refresh Google access token.');return d.access_token}
 async function query(token,site,body){const r=await fetch(`https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(site)}/searchAnalytics/query`,{method:'POST',headers:{authorization:`Bearer ${token}`,'content-type':'application/json'},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw new Error(d?.error?.message||'Search Console API request failed.');return d}
-function pathOf(v){try{let p=new URL(v,'https://oceanliners.net').pathname||'/';p=p.replace(/\/index\.html?$/i,'/').replace(/\.html?$/i,'');return p.length>1?p.replace(/\/$/,''):p}catch{return String(v||'')}}
+function normalizePath(v){if(!v)return'';return pathOf(v)}function pathOf(v){try{let p=new URL(v,'https://oceanliners.net').pathname||'/';p=p.replace(/\/index\.html?$/i,'/').replace(/\.html?$/i,'');return p.length>1?p.replace(/\/$/,''):p}catch{return String(v||'')}}
 function ymd(d){return d.toISOString().slice(0,10)}function json(v,s=200){return new Response(JSON.stringify(v),{status:s,headers:{'content-type':'application/json; charset=utf-8','cache-control':'no-store'}})}

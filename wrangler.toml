@@ -1,0 +1,15 @@
+name = "search-intelligence"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+[vars]
+SITE_URL = "https://www.oceanliners.net"
+APP_NAME = "CuratorOS Search Intelligence"
+
+# Optional bindings for later phases:
+# [[kv_namespaces]]
+# binding = "SEARCH_CACHE"
+# id = "..."
+#
+# [triggers]
+# crons = ["17 7 * * *"]

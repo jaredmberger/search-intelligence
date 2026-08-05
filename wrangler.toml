@@ -8,6 +8,10 @@ APP_NAME = "CuratorOS Search Intelligence"
 LINK_MAP_API_URL = "https://link-map.oceanliners.net/api/search-intelligence"
 SITE_HEALTH_API_URL = "https://site-health.oceanliners.net/api/search-intelligence"
 
+[[kv_namespaces]]
+binding = "SEARCH_INTELLIGENCE_RECORDS"
+id = "b469b6c1bfc04b48b00c5d887bd16594"
+
 # CuratorOS context integrations are intentionally read-only from Search Intelligence.
 # Link Map supplies the graph snapshot. Site Health is queried on demand only for the
 # small set of pages in the active recommendation queue, avoiding full-site subrequest

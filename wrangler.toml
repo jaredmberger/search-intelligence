@@ -5,15 +5,14 @@ compatibility_date = "2026-08-01"
 [vars]
 SITE_URL = "https://www.oceanliners.net"
 APP_NAME = "CuratorOS Search Intelligence"
+LINK_MAP_API_URL = "https://link-map.oceanliners.net/api/search-intelligence"
+SITE_HEALTH_API_URL = "https://site-health.oceanliners.net/api/search-intelligence"
 
-# Optional CuratorOS context integrations.
-# Set these in Cloudflare when the corresponding tools expose JSON endpoints.
-# LINK_MAP_API_URL = "https://curator.oceanliners.net/link-map/api/export"
-# SITE_HEALTH_API_URL = "https://curator.oceanliners.net/site-health/api/export"
-#
-# Search Intelligence tolerates either integration being absent or temporarily
-# unavailable; Search Console analysis continues normally and the UI reports
-# integration status.
+# CuratorOS context integrations are intentionally read-only from Search Intelligence.
+# Link Map publishes its graph snapshot to LINK_MAP_CACHE; Site Health publishes its
+# technical snapshot to SITE_HEALTH_INTEGRATION_CACHE. Search Intelligence consumes
+# only the public integration payloads above and continues normally if either sibling
+# service is temporarily unavailable.
 
 # Optional bindings for later phases:
 # [[kv_namespaces]]

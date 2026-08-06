@@ -1,6 +1,7 @@
 const SNAPSHOT_INDEX='watchtower:index';
 const SNAPSHOT_PREFIX='snapshot:';
 const OUTCOME_PREFIX='outcome:';
+const MAX_VERIFICATION_SNAPSHOTS=6;
 
 export async function handleCuratorIntelligence(request,env){
   if(request.method==='OPTIONS')return new Response(null,{status:204,headers:corsHeaders()});
@@ -20,6 +21,7 @@ export async function handleCuratorIntelligence(request,env){
   const signalPages=[...new Set(events.map(event=>normalizePage(event.page||'')).filter(Boolean))].slice(0,8);
   const technical=await fetchSiteHealth(env,signalPages);
   const technicalByPage=new Map((technical.pages||[]).map(page=>[normalizePage(page.path||''),page]));
+  const verificationContext=await buildVerificationContext(env,dates,signalPages);
 
   const priorities=events.slice(0,5).map(event=>{
     const entity=event.page||event.subject||'';
@@ -77,7 +79,8 @@ export async function handleCuratorIntelligence(request,env){
       implementedOutcomes:implemented.length,
       highSignalEvents:highEvents.length,
       healthPagesChecked:Number(technical.checkedPageCount||0),
-      healthProblemPages:Number(technical.problemPageCount||0)
+      healthProblemPages:Number(technical.problemPageCount||0),
+      verificationSnapshots:Number(verificationContext.snapshotCount||0)
     },
     signalPages,
     technicalContext:{
@@ -86,6 +89,7 @@ export async function handleCuratorIntelligence(request,env){
       error:technical.error||null,
       pages:(technical.pages||[]).map(normalizeHealthPage)
     },
+    verificationContext,
     priorities,
     opportunities,
     activity:events.slice(0,5).map(event=>({title:event.title||'Search visibility event',summary:event.detail||'',meta:[latestDate,event.page,event.query].filter(Boolean).join(' · ')}))
@@ -93,6 +97,37 @@ export async function handleCuratorIntelligence(request,env){
 
   const callback=safeCallback(url.searchParams.get('callback'));
   return callback?javascript(payload,callback):json(payload);
+}
+
+async function buildVerificationContext(env,dates,pages){
+  const selected=(dates||[]).slice(0,MAX_VERIFICATION_SNAPSHOTS).sort();
+  const wanted=new Set((pages||[]).map(normalizePage).filter(Boolean));
+  const byPage=new Map([...wanted].map(path=>[path,[]]));
+  for(const date of selected){
+    const snapshot=await env.SEARCH_INTELLIGENCE_RECORDS.get(SNAPSHOT_PREFIX+date,'json');
+    if(!snapshot)continue;
+    const metrics=new Map((snapshot.pages||[]).map(row=>[normalizePage(row.path||''),row]));
+    for(const path of wanted){
+      const row=metrics.get(path);
+      if(!row)continue;
+      byPage.get(path).push({
+        date:snapshot.date||date,
+        clicks:Number(row.clicks||0),
+        impressions:Number(row.impressions||0),
+        ctr:Number(row.ctr||0),
+        position:Number(row.position||0)
+      });
+    }
+  }
+  return{
+    source:'Watchtower',
+    mode:'bounded-page-history',
+    snapshotCount:selected.length,
+    maxSnapshots:MAX_VERIFICATION_SNAPSHOTS,
+    attribution:false,
+    note:'Trajectory evidence only; do not infer that a recommendation caused a search change without a recorded intervention.',
+    pages:[...byPage].map(([path,points])=>({path,pointCount:points.length,points}))
+  };
 }
 
 async function fetchSiteHealth(env,pages){

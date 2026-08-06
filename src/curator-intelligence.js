@@ -17,25 +17,38 @@ export async function handleCuratorIntelligence(request,env){
   const planned=outcomes.filter(x=>x.status==='planned');
   const highEvents=events.filter(x=>x.severity==='high');
 
-  const priorities=events.slice(0,5).map(event=>({
-    title:event.title||'Search visibility change',
-    summary:event.detail||'',
-    severity:event.severity==='high'?'high':event.severity==='medium'?'medium':'low',
-    entity:event.page||event.subject||'',
-    query:event.query||'',
-    score:Number(event.score||0),
-    sources:['Search Intelligence']
-  }));
+  const signalPages=[...new Set(events.map(event=>normalizePage(event.page||'')).filter(Boolean))].slice(0,8);
+  const technical=await fetchSiteHealth(env,signalPages);
+  const technicalByPage=new Map((technical.pages||[]).map(page=>[normalizePage(page.path||''),page]));
 
-  const opportunities=events.filter(event=>['new-query','impression-surge','rank-rise','query-top10','top10-enter'].includes(event.type)).slice(0,5).map(event=>({
-    title:event.title||'Search opportunity',
-    summary:event.detail||'',
-    meta:[event.page,event.query].filter(Boolean).join(' · '),
-    entity:event.page||'',
-    query:event.query||'',
-    score:Number(event.score||0),
-    source:'Search Intelligence'
-  }));
+  const priorities=events.slice(0,5).map(event=>{
+    const entity=event.page||event.subject||'';
+    const health=technicalByPage.get(normalizePage(entity));
+    return {
+      title:event.title||'Search visibility change',
+      summary:event.detail||'',
+      severity:event.severity==='high'?'high':event.severity==='medium'?'medium':'low',
+      entity,
+      query:event.query||'',
+      score:Number(event.score||0),
+      sources:['Search Intelligence'],
+      siteHealth:health?normalizeHealthPage(health):null
+    };
+  });
+
+  const opportunities=events.filter(event=>['new-query','impression-surge','rank-rise','query-top10','top10-enter'].includes(event.type)).slice(0,5).map(event=>{
+    const health=technicalByPage.get(normalizePage(event.page||''));
+    return {
+      title:event.title||'Search opportunity',
+      summary:event.detail||'',
+      meta:[event.page,event.query].filter(Boolean).join(' · '),
+      entity:event.page||'',
+      query:event.query||'',
+      score:Number(event.score||0),
+      source:'Search Intelligence',
+      siteHealth:health?normalizeHealthPage(health):null
+    };
+  });
 
   const totals=latest?.totals||{};
   const status=highEvents.length?'warning':'good';
@@ -62,7 +75,15 @@ export async function handleCuratorIntelligence(request,env){
       position:Number(totals.position||0),
       trackedOutcomes:outcomes.length,
       implementedOutcomes:implemented.length,
-      highSignalEvents:highEvents.length
+      highSignalEvents:highEvents.length,
+      healthPagesChecked:Number(technical.checkedPageCount||0),
+      healthProblemPages:Number(technical.problemPageCount||0)
+    },
+    technicalContext:{
+      source:'Site Health',
+      ok:Boolean(technical.ok),
+      error:technical.error||null,
+      pages:(technical.pages||[]).map(normalizeHealthPage)
     },
     priorities,
     opportunities,
@@ -71,6 +92,22 @@ export async function handleCuratorIntelligence(request,env){
 
   const callback=safeCallback(url.searchParams.get('callback'));
   return callback?javascript(payload,callback):json(payload);
+}
+
+async function fetchSiteHealth(env,pages){
+  if(!pages.length)return{ok:true,checkedPageCount:0,problemPageCount:0,pages:[]};
+  if(!env.SITE_HEALTH_API_URL)return{ok:false,error:'SITE_HEALTH_API_URL is not configured.',checkedPageCount:0,problemPageCount:0,pages:[]};
+  const endpoint=`${String(env.SITE_HEALTH_API_URL).replace(/\/$/,'')}/check`;
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),12000);
+  try{
+    const response=await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json',accept:'application/json','user-agent':'CuratorOS-Curator-Intelligence/1.0'},body:JSON.stringify({pages}),signal:controller.signal});
+    const text=await response.text();
+    let data=null;try{data=text?JSON.parse(text):null}catch{}
+    if(!response.ok||data?.ok===false)return{ok:false,error:data?.error||`Site Health returned HTTP ${response.status}`,checkedPageCount:0,problemPageCount:0,pages:[]};
+    return data||{ok:false,error:'Site Health returned an empty response.',checkedPageCount:0,problemPageCount:0,pages:[]};
+  }catch(error){return{ok:false,error:error?.name==='AbortError'?'Site Health bounded check timed out':(error?.message||String(error)),checkedPageCount:0,problemPageCount:0,pages:[]}}
+  finally{clearTimeout(timer)}
 }
 
 async function readDates(env){
@@ -91,6 +128,8 @@ function collectEvents(snapshot){
   const events=Array.isArray(snapshot?.events)?snapshot.events:[];
   return [...events].sort((a,b)=>Number(b.score||0)-Number(a.score||0));
 }
+function normalizeHealthPage(page){return{path:normalizePage(page.path||''),ok:page.ok!==false,httpStatus:Number(page.httpStatus||0)||null,canonicalOk:page.canonicalOk!==false,indexable:page.indexable!==false,issues:Array.isArray(page.issues)?page.issues.map(String):[]}}
+function normalizePage(value){if(!value)return'';try{const url=new URL(String(value),'https://oceanliners.net');let path=url.pathname||'/';path=path.replace(/\/index\.html?$/i,'/').replace(/\.html?$/i,'');if(path.length>1)path=path.replace(/\/$/,'');return path.toLowerCase()}catch{let path=String(value).trim();if(!path.startsWith('/'))path=`/${path}`;path=path.replace(/\.html?$/i,'');if(path.length>1)path=path.replace(/\/$/,'');return path.toLowerCase()}}
 function safeCallback(value){return/^[A-Za-z_$][A-Za-z0-9_$.]*$/.test(String(value||''))?String(value):''}
 function javascript(value,callback){return new Response(`${callback}(${JSON.stringify(value)});`,{status:200,headers:{'content-type':'application/javascript; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','x-robots-tag':'noindex, nofollow, noarchive'}})}
 function corsHeaders(){return{'access-control-allow-origin':'https://tools.oceanliners.net','access-control-allow-methods':'GET,OPTIONS','access-control-allow-headers':'content-type','vary':'Origin'}}

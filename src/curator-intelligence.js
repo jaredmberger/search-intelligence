@@ -7,6 +7,7 @@ export async function handleCuratorIntelligence(request,env){
   if(request.method!=='GET')return json({ok:false,error:'Method not allowed.'},405);
   if(!env.SEARCH_INTELLIGENCE_RECORDS)return json({ok:false,error:'SEARCH_INTELLIGENCE_RECORDS KV binding is not configured.'},503);
 
+  const url=new URL(request.url);
   const dates=await readDates(env);
   const latestDate=dates[0]||null;
   const latest=latestDate?await env.SEARCH_INTELLIGENCE_RECORDS.get(SNAPSHOT_PREFIX+latestDate,'json'):null;
@@ -44,7 +45,7 @@ export async function handleCuratorIntelligence(request,env){
     ? `Watchtower has ${dates.length} snapshot${dates.length===1?'':'s'} and ${outcomes.length} tracked intervention${outcomes.length===1?'':'s'}.`
     : 'Search Intelligence is connected and waiting for its first Watchtower snapshot.';
 
-  return json({
+  const payload={
     ok:true,
     generatedAt:new Date().toISOString(),
     system:{
@@ -66,7 +67,10 @@ export async function handleCuratorIntelligence(request,env){
     priorities,
     opportunities,
     activity:events.slice(0,5).map(event=>({title:event.title||'Search visibility event',summary:event.detail||'',meta:[latestDate,event.page,event.query].filter(Boolean).join(' · ')}))
-  });
+  };
+
+  const callback=safeCallback(url.searchParams.get('callback'));
+  return callback?javascript(payload,callback):json(payload);
 }
 
 async function readDates(env){
@@ -87,6 +91,7 @@ function collectEvents(snapshot){
   const events=Array.isArray(snapshot?.events)?snapshot.events:[];
   return [...events].sort((a,b)=>Number(b.score||0)-Number(a.score||0));
 }
-
+function safeCallback(value){return/^[A-Za-z_$][A-Za-z0-9_$.]*$/.test(String(value||''))?String(value):''}
+function javascript(value,callback){return new Response(`${callback}(${JSON.stringify(value)});`,{status:200,headers:{'content-type':'application/javascript; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','x-robots-tag':'noindex, nofollow, noarchive'}})}
 function corsHeaders(){return{'access-control-allow-origin':'https://tools.oceanliners.net','access-control-allow-methods':'GET,OPTIONS','access-control-allow-headers':'content-type','vary':'Origin'}}
 function json(value,status=200){return new Response(JSON.stringify(value),{status,headers:{'content-type':'application/json; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff',...corsHeaders()}})}

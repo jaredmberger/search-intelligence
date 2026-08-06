@@ -7,6 +7,7 @@ SITE_URL = "https://www.oceanliners.net"
 APP_NAME = "CuratorOS Search Intelligence"
 LINK_MAP_API_URL = "https://link-map.oceanliners.net/api/search-intelligence"
 SITE_HEALTH_API_URL = "https://site-health.oceanliners.net/api/search-intelligence"
+INTEGRITY_API_URL = "https://integrity.oceanliners.net/api/curator-intelligence"
 
 [[kv_namespaces]]
 binding = "SEARCH_INTELLIGENCE_RECORDS"
@@ -16,9 +17,9 @@ id = "b469b6c1bfc04b48b00c5d887bd16594"
 crons = ["17 7 * * *"]
 
 # CuratorOS context integrations are intentionally read-only from Search Intelligence.
-# Link Map supplies the graph snapshot. Site Health is queried on demand only for the
-# small set of pages in the active recommendation queue, avoiding full-site subrequest
-# limits while keeping technical checks fresh.
+# Link Map supplies the graph snapshot. Site Health and Curator Integrity are queried
+# only for the small set of pages in the active recommendation queue, avoiding full-site
+# scans while keeping technical and standards context fresh.
 #
 # Watchtower captures one compact Search Console snapshot daily at 07:17 UTC and stores
 # it in SEARCH_INTELLIGENCE_RECORDS. Historical snapshots are retained for about 210 days.

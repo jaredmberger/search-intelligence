@@ -2,6 +2,7 @@ const SNAPSHOT_INDEX='watchtower:index';
 const SNAPSHOT_PREFIX='snapshot:';
 const OUTCOME_PREFIX='outcome:';
 const MAX_VERIFICATION_SNAPSHOTS=6;
+const LEARNING_MIN_AGE_DAYS=14;
 
 export async function handleCuratorIntelligence(request,env){
   if(request.method==='OPTIONS')return new Response(null,{status:204,headers:corsHeaders()});
@@ -22,6 +23,7 @@ export async function handleCuratorIntelligence(request,env){
   const technical=await fetchSiteHealth(env,signalPages);
   const technicalByPage=new Map((technical.pages||[]).map(page=>[normalizePage(page.path||''),page]));
   const verificationContext=await buildVerificationContext(env,dates,signalPages);
+  const learningContext=buildLearningContext(outcomes,latest);
 
   const priorities=events.slice(0,5).map(event=>{
     const entity=event.page||event.subject||'';
@@ -60,12 +62,18 @@ export async function handleCuratorIntelligence(request,env){
     ? `Watchtower has ${dates.length} snapshot${dates.length===1?'':'s'} and ${outcomes.length} tracked intervention${outcomes.length===1?'':'s'}.`
     : 'Search Intelligence is connected and waiting for its first Watchtower snapshot.';
 
+  const learningActivity={
+    title:'Learning / Memory v1',
+    summary:learningContext.summary,
+    meta:`Search Intelligence · ${learningContext.state==='learning'?'durable outcome memory':'baseline building'}`
+  };
+
   const payload={
     ok:true,
     generatedAt:new Date().toISOString(),
     system:{
       id:'search-intelligence',name:'Search Intelligence',status,statusLabel,value,summary,
-      detail:latestDate?`Latest snapshot ${latestDate} · ${implemented.length} implemented · ${planned.length} planned`:'Watchtower baseline pending',
+      detail:latestDate?`Latest snapshot ${latestDate} · ${implemented.length} implemented · ${planned.length} planned · ${learningContext.eligibleCount} learning-ready`:'Watchtower baseline pending',
       url:'https://search-intelligence.oceanliners.net/'
     },
     metrics:{
@@ -77,6 +85,8 @@ export async function handleCuratorIntelligence(request,env){
       position:Number(totals.position||0),
       trackedOutcomes:outcomes.length,
       implementedOutcomes:implemented.length,
+      learningReadyOutcomes:Number(learningContext.eligibleCount||0),
+      learnedPatterns:Number(learningContext.patterns?.length||0),
       highSignalEvents:highEvents.length,
       healthPagesChecked:Number(technical.checkedPageCount||0),
       healthProblemPages:Number(technical.problemPageCount||0),
@@ -90,13 +100,117 @@ export async function handleCuratorIntelligence(request,env){
       pages:(technical.pages||[]).map(normalizeHealthPage)
     },
     verificationContext,
+    learningContext,
     priorities,
     opportunities,
-    activity:events.slice(0,5).map(event=>({title:event.title||'Search visibility event',summary:event.detail||'',meta:[latestDate,event.page,event.query].filter(Boolean).join(' · ')}))
+    activity:[learningActivity,...events.slice(0,4).map(event=>({title:event.title||'Search visibility event',summary:event.detail||'',meta:[latestDate,event.page,event.query].filter(Boolean).join(' · ')}))]
   };
 
   const callback=safeCallback(url.searchParams.get('callback'));
   return callback?javascript(payload,callback):json(payload);
+}
+
+function buildLearningContext(outcomes,latest){
+  const latestPages=new Map((latest?.pages||[]).map(row=>[normalizePage(row.path||''),row]));
+  const observations=[];
+
+  for(const record of outcomes||[]){
+    if(record?.status!=='implemented'||!record?.implementedAt)continue;
+    const implementedAt=new Date(record.implementedAt).getTime();
+    if(!Number.isFinite(implementedAt))continue;
+    const ageDays=Math.max(0,Math.floor((Date.now()-implementedAt)/86400000));
+    if(ageDays<LEARNING_MIN_AGE_DAYS)continue;
+
+    const path=normalizePage(record.page||'');
+    const current=path?latestPages.get(path):null;
+    const baseline=record?.baseline?.search||record?.baseline||null;
+    if(!current||!baseline)continue;
+
+    const direction=classifyOutcomeDirection(baseline,current);
+    const type=learningType(record);
+    observations.push({
+      id:String(record.id||''),
+      type,
+      page:path,
+      ageDays,
+      direction,
+      implementedAt:record.implementedAt,
+      source:String(record.source||''),
+      opportunityType:String(record.opportunityType||''),
+      signalLanes:Array.isArray(record.signalLanes)?record.signalLanes:[]
+    });
+  }
+
+  const groups=new Map();
+  for(const observation of observations){
+    if(!groups.has(observation.type))groups.set(observation.type,{type:observation.type,total:0,improved:0,declined:0,unchanged:0});
+    const group=groups.get(observation.type);
+    group.total+=1;
+    group[observation.direction]=(group[observation.direction]||0)+1;
+  }
+
+  const patterns=[...groups.values()].map(group=>{
+    let tendency='mixed';
+    if(group.improved>group.declined&&group.improved>=group.unchanged)tendency='improving';
+    else if(group.declined>group.improved&&group.declined>=group.unchanged)tendency='worsening';
+    else if(group.unchanged>=group.improved&&group.unchanged>=group.declined)tendency='unchanged';
+    const confidence=group.total>=5?'moderate':group.total>=3?'early':'very-early';
+    return {...group,tendency,confidence};
+  }).sort((a,b)=>b.total-a.total||a.type.localeCompare(b.type));
+
+  const state=observations.length?'learning':'baseline-building';
+  const summary=observations.length
+    ? `${observations.length} implemented intervention${observations.length===1?'':'s'} are old enough and have comparable search baselines. ${patterns.length} recommendation pattern${patterns.length===1?' is':'s are'} being remembered; evidence remains observational and does not establish causation.`
+    : `No implemented intervention is yet both at least ${LEARNING_MIN_AGE_DAYS} days old and comparable to the latest Watchtower page data. Memory is connected and building its baseline.`;
+
+  return{
+    source:'Search Intelligence outcomes',
+    mode:'durable-observational-memory',
+    state,
+    minAgeDays:LEARNING_MIN_AGE_DAYS,
+    trackedCount:(outcomes||[]).length,
+    eligibleCount:observations.length,
+    attribution:false,
+    note:'Patterns summarize stored intervention outcomes. They are evidence memory, not causal proof and do not automatically change recommendations.',
+    summary,
+    patterns,
+    observations:observations.slice(0,20)
+  };
+}
+
+function classifyOutcomeDirection(baseline,current){
+  const baseClicks=num(baseline.clicks);
+  const baseImpressions=num(baseline.impressions);
+  const baseCtr=num(baseline.ctr);
+  const basePosition=num(baseline.averagePosition??baseline.position);
+  const currentClicks=num(current.clicks);
+  const currentImpressions=num(current.impressions);
+  const currentCtr=num(current.ctr);
+  const currentPosition=num(current.position);
+  const clicksPct=percentDelta(currentClicks,baseClicks);
+  const impressionsPct=percentDelta(currentImpressions,baseImpressions);
+  const positionGain=basePosition-currentPosition;
+  const ctrGain=currentCtr-baseCtr;
+  let score=0;
+  if(clicksPct>=20&&Math.abs(currentClicks-baseClicks)>=2)score+=2;else if(clicksPct<=-20&&Math.abs(currentClicks-baseClicks)>=2)score-=2;
+  if(impressionsPct>=20&&Math.abs(currentImpressions-baseImpressions)>=20)score+=1;else if(impressionsPct<=-20&&Math.abs(currentImpressions-baseImpressions)>=20)score-=1;
+  if(positionGain>=2)score+=2;else if(positionGain<=-2)score-=2;
+  if(ctrGain>=1)score+=1;else if(ctrGain<=-1)score-=1;
+  return score>=2?'improved':score<=-2?'declined':'unchanged';
+}
+
+function learningType(record){
+  const opportunity=String(record?.opportunityType||'').trim();
+  if(opportunity)return opportunity;
+  const lanes=Array.isArray(record?.signalLanes)?record.signalLanes.filter(Boolean):[];
+  if(lanes.length)return lanes.sort().join('+');
+  const source=String(record?.source||'').trim();
+  if(source)return source;
+  const recommendation=String(record?.recommendation||'').toLowerCase();
+  if(/link|internal/.test(recommendation))return'internal-links';
+  if(/technical|canonical|index/.test(recommendation))return'technical';
+  if(/content|title|description|editorial/.test(recommendation))return'content';
+  return'other';
 }
 
 async function buildVerificationContext(env,dates,pages){
@@ -166,6 +280,8 @@ function collectEvents(snapshot){
 }
 function normalizeHealthPage(page){return{path:normalizePage(page.path||''),ok:page.ok!==false,httpStatus:Number(page.httpStatus||0)||null,canonicalOk:page.canonicalOk!==false,indexable:page.indexable!==false,issues:Array.isArray(page.issues)?page.issues.map(String):[]}}
 function normalizePage(value){if(!value)return'';try{const url=new URL(String(value),'https://oceanliners.net');let path=url.pathname||'/';path=path.replace(/\/index\.html?$/i,'/').replace(/\.html?$/i,'');if(path.length>1)path=path.replace(/\/$/,'');return path.toLowerCase()}catch{let path=String(value).trim();if(!path.startsWith('/'))path=`/${path}`;path=path.replace(/\.html?$/i,'');if(path.length>1)path=path.replace(/\/$/,'');return path.toLowerCase()}}
+function num(value){const n=Number(value||0);return Number.isFinite(n)?n:0}
+function percentDelta(current,baseline){if(!baseline)return current?100:0;return((current-baseline)/Math.abs(baseline))*100}
 function safeCallback(value){return/^[A-Za-z_$][A-Za-z0-9_$.]*$/.test(String(value||''))?String(value):''}
 function javascript(value,callback){return new Response(`${callback}(${JSON.stringify(value)});`,{status:200,headers:{'content-type':'application/javascript; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','x-robots-tag':'noindex, nofollow, noarchive'}})}
 function corsHeaders(){return{'access-control-allow-origin':'https://tools.oceanliners.net','access-control-allow-methods':'GET,OPTIONS','access-control-allow-headers':'content-type','vary':'Origin'}}

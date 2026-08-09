@@ -1,5 +1,5 @@
 name = "search-intelligence"
-main = "src/entry.js"
+main = "src/entry-v1.1.js"
 compatibility_date = "2026-08-01"
 
 [vars]
@@ -12,6 +12,10 @@ INTEGRITY_API_URL = "https://integrity.oceanliners.net/api/curator-intelligence"
 [[kv_namespaces]]
 binding = "SEARCH_INTELLIGENCE_RECORDS"
 id = "b469b6c1bfc04b48b00c5d887bd16594"
+
+[[kv_namespaces]]
+binding = "CURATOR_ERROR_RECORDS"
+id = "447306da3a754b44830d2ac8608322c0"
 
 [triggers]
 crons = ["17 7 * * *"]

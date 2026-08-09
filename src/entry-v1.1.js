@@ -1,4 +1,5 @@
 import base from './entry.js';
+import { captureWatchtowerSnapshot } from './watchtower.js';
 import { reportSystemError, reportSystemSuccess } from './error-bus.js';
 
 const SOURCE = 'Search Intelligence';
@@ -21,12 +22,9 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    const pending = [];
-    const captureCtx = { waitUntil(promise) { pending.push(Promise.resolve(promise)); } };
     ctx.waitUntil((async () => {
       try {
-        await base.scheduled(controller, env, captureCtx);
-        await Promise.all(pending);
+        await captureWatchtowerSnapshot(env);
         await reportSystemSuccess(env, {
           source: SOURCE,
           component: 'watchtower-snapshot',

@@ -100,6 +100,7 @@ async function buildLivePayload(env, days) {
     top50: buckets.top50 - previousBuckets.top50,
   };
   const recommendations = enrichWithCuratorContext(buildRecommendations(queries), curatorContext);
+  const searchLinkOpportunities = buildSearchLinkOpportunities(pages, curatorContext.linkMap);
   const today = buildTodayQueue(recommendations);
   const movers = buildMovers(queries, pages);
 
@@ -116,6 +117,7 @@ async function buildLivePayload(env, days) {
     previousBuckets,
     bucketDelta,
     recommendations,
+    searchLinkOpportunities,
     today,
     movers,
     queries: queries.slice(0, 100),
@@ -550,6 +552,44 @@ function enrichRecommendation(rec) {
   };
 }
 
+function buildSearchLinkOpportunities(pages, linkMap) {
+  if (!(linkMap instanceof Map) || !linkMap.size) return [];
+
+  return pages
+    .map(page => {
+      const link = linkMap.get(page.path);
+      if (!link || link.orphan || link.inboundCount > 1 || page.impressions < 20) return null;
+
+      const position = Number(page.position || 0);
+      const positionOpportunity =
+        position > 0 && position <= 10 ? 24 :
+        position <= 20 ? 30 :
+        position <= 40 ? 20 : 8;
+      const demandScore = Math.min(45, Math.log10(Number(page.impressions || 0) + 1) * 15);
+      const weakLinkScore = link.inboundCount === 0 ? 20 : 14;
+      const momentumScore = Math.max(-6, Math.min(8, Number(page.positionChange || 0) * 2));
+      const score = Math.max(0, Math.min(100, Math.round(demandScore + positionOpportunity + weakLinkScore + momentumScore)));
+
+      return {
+        page: page.path,
+        clicks: Number(page.clicks || 0),
+        impressions: Number(page.impressions || 0),
+        ctr: Number(page.ctr || 0),
+        position,
+        trend: Number(page.trend || 0),
+        positionChange: Number(page.positionChange || 0),
+        inboundCount: Number(link.inboundCount || 0),
+        outboundCount: Number(link.outboundCount || 0),
+        suggestions: Array.isArray(link.suggestions) ? link.suggestions.slice(0, 4) : [],
+        score,
+        reason: `${Number(page.impressions || 0).toLocaleString()} impressions at average position #${round1(position)} with only ${Number(link.inboundCount || 0)} inbound internal link${Number(link.inboundCount || 0) === 1 ? '' : 's'}.`
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score || b.impressions - a.impressions || a.position - b.position)
+    .slice(0, 20);
+}
+
 function buildTodayQueue(recommendations) {
   const actionable = recommendations.filter(x => x.type !== 'leave');
   const highValue = actionable.filter(x => x.priorityScore >= 55 && x.confidence !== 'low');
@@ -606,6 +646,7 @@ function demoPayload() {
     previousBuckets: { top3: 22, top10: 77, top20: 154, top50: 429 },
     bucketDelta: { top3: 6, top10: 17, top20: 27, top50: 34 },
     recommendations,
+    searchLinkOpportunities: [],
     today: buildTodayQueue(recommendations),
     movers: { enteredTop10: [], leftTop10: [], emerging: [], risingQueries: [], fallingQueries: [], risingPages: [], fallingPages: [] },
     queries: [],
@@ -654,6 +695,7 @@ function renderApp() {
 <section class="card"><div class="section-head"><div><span class="eyebrow">Decision engine</span><h2>What should I work on?</h2></div><p>Period-over-period priorities</p></div><div id="recommendations"></div></section>
 <section class="card"><div class="section-head"><div><span class="eyebrow">Ranking footprint</span><h2>Where the site appears</h2></div><p>Current query buckets</p></div><div class="grid bucket-grid" id="buckets"></div></section>
 </div>
+<section><div class="section-head"><div><span class="eyebrow">Search × Link Map</span><h2>High-demand pages with weak internal support</h2></div><p>Search Console demand cross-referenced with pages having 0–1 inbound internal links.</p></div><div class="card today-list" id="searchLinkOpportunities"></div></section>
 <section><div class="section-head"><div><span class="eyebrow">Page intelligence</span><h2>Pages gaining and losing visibility</h2></div><p>Compared with the immediately preceding period.</p></div><div class="card" style="overflow:auto"><table><thead><tr><th>Page</th><th style="text-align:right">Clicks</th><th style="text-align:right">Impressions</th><th style="text-align:right">CTR</th><th style="text-align:right">Position</th><th style="text-align:right">Visibility</th><th style="text-align:right">Rank Δ</th></tr></thead><tbody id="pages"></tbody></table></div></section>
 <footer class="foot">CuratorOS Search Intelligence · Built for oceanliners.net. Search data informs the decision; CuratorOS context determines the action.</footer>
 </div>
@@ -689,6 +731,8 @@ async function load(){
   document.querySelector('#positionDelta').textContent=signed(c.position||0)+' places vs prior period';document.querySelector('#positionDelta').className=deltaClass(c.position||0);
   const today=d.today||[];
   document.querySelector('#today').innerHTML=today.length?today.map(x=>'<article class="today-item"><div class="today-top"><div><span class="eyebrow">#'+x.rank+' · Priority '+x.priorityScore+'</span><h3>'+escapeHtml(x.title)+'</h3></div><div><span class="pill">'+escapeHtml(x.confidence)+' confidence</span><span class="pill">'+escapeHtml(x.expectedUpside)+' upside</span></div></div><p><strong>'+escapeHtml(x.query)+'</strong> · '+escapeHtml(x.page)+'</p><p>'+escapeHtml((x.evidence||[]).join(' · '))+'</p><p class="action"><strong>Next:</strong> '+escapeHtml(x.action)+'</p></article>').join(''):'<p style="color:var(--muted);font:14px system-ui,sans-serif">No high-value actions need attention in this period.</p>';
+  const searchLinks=d.searchLinkOpportunities||[];
+  document.querySelector('#searchLinkOpportunities').innerHTML=searchLinks.length?searchLinks.slice(0,10).map((x,index)=>'<article class="today-item"><div class="today-top"><div><span class="eyebrow">#'+(index+1)+' · Cross-signal '+x.score+'</span><h3>'+escapeHtml(x.page)+'</h3></div><div><span class="pill">'+x.inboundCount+' inbound</span><span class="pill">#'+(x.position||0).toFixed(1)+' avg position</span></div></div><p>'+escapeHtml(x.reason)+'</p><p>'+((x.suggestions||[]).length?'<strong>Suggested source pages:</strong> '+(x.suggestions||[]).map(s=>escapeHtml(s.from)).join(' · '):'No Link Map source suggestion is currently available; inspect nearby topical pages manually.')+'</p></article>').join(''):'<p style="color:var(--muted);font:14px system-ui,sans-serif">No pages currently combine meaningful search demand with 0–1 inbound internal links.</p>';
   const bd=d.bucketDelta||{};
   document.querySelector('#buckets').innerHTML=[['Top 3',d.buckets.top3,bd.top3],['Top 10',d.buckets.top10,bd.top10],['Top 20',d.buckets.top20,bd.top20],['Top 50',d.buckets.top50,bd.top50]].map(x=>'<div class="bucket"><strong>'+fmt(x[1])+'</strong><span>queries in '+x[0]+' · <b class="'+deltaClass(x[2]||0)+'">'+signed(x[2]||0)+'</b></span></div>').join('');
   const icon={strengthen:'↑',protect:'◆',ctr:'↗',leave:'✓',decline:'↓',breakthrough:'★',emerging:'+'};

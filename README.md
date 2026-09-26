@@ -12,3 +12,7 @@ Operational endpoints used by Curator Ops:
 - `GET /api/ops-health` — reports freshness of the daily Watchtower snapshot heartbeat.
 
 The Watchtower scheduled job runs daily at 07:17 UTC.
+
+## Disaster recovery
+
+The complete primary `SEARCH_INTELLIGENCE_RECORDS` namespace can be exported through authenticated `GET /api/recovery-export`. Configure the Worker secret `RECOVERY_EXPORT_TOKEN`; the route remains disabled if the secret is absent. The shared `CURATOR_ERROR_RECORDS` namespace is intentionally excluded because its authoritative recovery export is owned by the Error Bus service. See [`RECOVERY_EXPORT.md`](RECOVERY_EXPORT.md).

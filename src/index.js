@@ -50,6 +50,7 @@ function hasGoogleConfig(env) {
 function integrationStatus(env) {
   return {
     linkMap: Boolean(env.LINK_MAP_API_URL),
+    discoverability: Boolean(env.DISCOVERABILITY_API_URL),
     siteHealth: Boolean(env.SITE_HEALTH_API_URL),
   };
 }
@@ -167,16 +168,22 @@ async function querySearchConsole(accessToken, siteUrl, body) {
 }
 
 async function fetchCuratorContext(env) {
-  const [linkMap, siteHealth] = await Promise.all([
+  const [linkMap, discoverability, siteHealth] = await Promise.all([
     fetchOptionalJson(env.LINK_MAP_API_URL, 'link-map'),
+    fetchOptionalJson(env.DISCOVERABILITY_API_URL, 'discoverability'),
     fetchOptionalJson(env.SITE_HEALTH_API_URL, 'site-health'),
   ]);
 
+  const primaryLinks = normalizeLinkMap(linkMap.data);
+  const structuralLinks = normalizeDiscoverability(discoverability.data);
+
   return {
-    linkMap: normalizeLinkMap(linkMap.data),
+    linkMap: mergeLinkContexts(primaryLinks, structuralLinks),
+    discoverability: structuralLinks,
     siteHealth: normalizeSiteHealth(siteHealth.data),
     summary: {
       linkMap: { configured: Boolean(env.LINK_MAP_API_URL), ok: linkMap.ok, error: linkMap.error || null },
+      discoverability: { configured: Boolean(env.DISCOVERABILITY_API_URL), ok: discoverability.ok, error: discoverability.error || null },
       siteHealth: { configured: Boolean(env.SITE_HEALTH_API_URL), ok: siteHealth.ok, error: siteHealth.error || null },
     },
   };
@@ -215,6 +222,44 @@ function normalizeLinkMap(data) {
     });
   }
   return byPage;
+}
+
+function normalizeDiscoverability(data) {
+  const byPage = new Map();
+  if (!data || !Array.isArray(data.pages)) return byPage;
+  for (const item of data.pages) {
+    const path = normalizePage(item.route || item.path || '');
+    if (!path) continue;
+    const editorialInbound = Number(item.editorialInbound ?? 0);
+    byPage.set(path, {
+      inboundCount: editorialInbound,
+      outboundCount: 0,
+      orphan: editorialInbound === 0,
+      suggestions: [],
+      discoverability: {
+        category: item.category || null,
+        sitemapListed: item.sitemapListed !== false,
+        searchEligible: item.searchEligible !== false,
+        baselineInbound: Number(item.baselineInbound ?? 0),
+        editorialInbound,
+      },
+    });
+  }
+  return byPage;
+}
+
+function mergeLinkContexts(primary, structural) {
+  const merged = new Map(primary instanceof Map ? primary : []);
+  if (!(structural instanceof Map)) return merged;
+  for (const [path, fallback] of structural) {
+    if (!merged.has(path)) {
+      merged.set(path, fallback);
+      continue;
+    }
+    const current = merged.get(path);
+    merged.set(path, { ...current, discoverability: fallback.discoverability || null });
+  }
+  return merged;
 }
 
 function normalizeLinkSuggestions(values) {
@@ -258,6 +303,10 @@ function enrichWithCuratorContext(recommendations, context) {
     if (link) {
       contextSignals.linkMap = link;
       evidence.push(`Internal links: ${link.inboundCount} inbound / ${link.outboundCount} outbound${link.orphan ? ' · orphan risk' : ''}`);
+      if (link.discoverability) {
+        const d = link.discoverability;
+        evidence.push(`Discoverability: ${d.editorialInbound} editorial / ${d.baselineInbound} baseline inbound · sitemap ${d.sitemapListed ? 'listed' : 'missing'}${d.category ? ` · ${d.category}` : ''}`);
+      }
       if ((rec.type === 'strengthen' || rec.type === 'emerging' || rec.type === 'decline') && (link.inboundCount < 4 || link.orphan)) {
         priorityScore = Math.min(100, priorityScore + 8);
         action = link.suggestions.length
@@ -654,7 +703,7 @@ function demoPayload() {
       { path: '/ships/rms-olympic', clicks: 451, impressions: 8240, ctr: 5.47, position: 7.2, trend: 18.4, clicksChange: 12.1, ctrChange: 0.3, positionChange: 1.2, previous: { clicks: 402, impressions: 6959, ctr: 5.78, position: 8.4 } },
       { path: '/how-long-did-it-take-titanic-to-sink', clicks: 682, impressions: 11320, ctr: 6.02, position: 3.7, trend: 4.1, clicksChange: 5.8, ctrChange: 0.1, positionChange: 0.2, previous: { clicks: 645, impressions: 10874, ctr: 5.93, position: 3.9 } },
     ],
-    curatorContext: { linkMap: { configured: false, ok: false }, siteHealth: { configured: false, ok: false } },
+    curatorContext: { linkMap: { configured: false, ok: false }, discoverability: { configured: false, ok: false }, siteHealth: { configured: false, ok: false } },
   };
 }
 
@@ -719,7 +768,7 @@ async function load(){
     document.querySelector('#statusText').textContent='Live Search Console data could not be loaded: '+error.message;
   }
   const cx=d.curatorContext||{};
-  document.querySelector('#integrationText').textContent='CuratorOS context · Link Map: '+integrationLabel(cx.linkMap)+' · Site Health: '+integrationLabel(cx.siteHealth);
+  document.querySelector('#integrationText').textContent='CuratorOS context · Link Map: '+integrationLabel(cx.linkMap)+' · Discoverability: '+integrationLabel(cx.discoverability)+' · Site Health: '+integrationLabel(cx.siteHealth);
   document.querySelector('#clicks').textContent=fmt(d.metrics.clicks);
   document.querySelector('#impressions').textContent=fmt(d.metrics.impressions);
   document.querySelector('#ctr').textContent=d.metrics.ctr.toFixed(2)+'%';

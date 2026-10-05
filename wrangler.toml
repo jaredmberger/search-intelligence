@@ -9,6 +9,7 @@ command = "node scripts/write-build-meta.mjs"
 SITE_URL = "https://www.oceanliners.net"
 APP_NAME = "CuratorOS Search Intelligence"
 LINK_MAP_API_URL = "https://link-map.oceanliners.net/api/search-intelligence"
+DISCOVERABILITY_API_URL = "https://oceanliners.net/data/curatoros-discoverability.json"
 SITE_HEALTH_API_URL = "https://site-health.oceanliners.net/api/search-intelligence"
 INTEGRITY_API_URL = "https://integrity.oceanliners.net/api/curator-intelligence"
 

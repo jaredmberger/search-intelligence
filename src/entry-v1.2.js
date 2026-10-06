@@ -1,7 +1,35 @@
 import base from './entry-v1.1.js';
 import { BUILD_META } from '../generated/build-meta.js';
 const SERVICE='Search Intelligence',REPOSITORY='jaredmberger/search-intelligence',HEARTBEAT_KEY='heartbeat:search-intelligence:watchtower-snapshot';
-export default{async fetch(request,env,ctx){const u=new URL(request.url);if(request.method==='GET'&&u.pathname==='/api/recovery-export'){const auth=requireRecoveryExportToken(request,env);if(auth)return auth;return recoveryExport(env)}if(request.method==='GET'&&u.pathname==='/api/runtime')return json(runtime(env));if(request.method==='GET'&&u.pathname==='/api/ops-health')return json(await health(env));return base.fetch(request,env,ctx)},async scheduled(c,e,x){return base.scheduled(c,e,x)}};
+export default{async fetch(request,env,ctx){const u=new URL(request.url);if(request.method==='GET'&&u.pathname==='/api/recovery-export'){const auth=requireRecoveryExportToken(request,env);if(auth)return auth;return recoveryExport(env)}if(request.method==='GET'&&u.pathname==='/api/analysis-export')return analysisExport(request,env,ctx);if(request.method==='GET'&&u.pathname==='/api/runtime')return json(runtime(env));if(request.method==='GET'&&u.pathname==='/api/ops-health')return json(await health(env));return base.fetch(request,env,ctx)},async scheduled(c,e,x){return base.scheduled(c,e,x)}};
+async function analysisExport(request,env,ctx){
+  if(String(env.ANALYSIS_EXPORT_ENABLED||'').toLowerCase()!=='true'){
+    return json({ok:false,error:'Analysis export is disabled.'},404);
+  }
+  const url=new URL(request.url);
+  const requested=Number(url.searchParams.get('days')||28);
+  const days=[7,28,90].includes(requested)?requested:28;
+  const internalUrl=new URL('/api/search',request.url);
+  internalUrl.searchParams.set('days',String(days));
+  const forwarded=new Request(internalUrl.toString(),{method:'GET',headers:{accept:'application/json'}});
+  const response=await base.fetch(forwarded,env,ctx);
+  const text=await response.text();
+  let payload=null;
+  try{payload=text?JSON.parse(text):null}catch{}
+  if(!response.ok||!payload){
+    return json({ok:false,error:'Search Intelligence analysis export failed.',status:response.status,detail:payload?.error||null},502);
+  }
+  return json({
+    ...payload,
+    analysisExport:{
+      temporary:true,
+      readOnly:true,
+      days,
+      generatedAt:new Date().toISOString(),
+      note:'Temporary read-only Search Intelligence analysis export. Disable ANALYSIS_EXPORT_ENABLED after external review.'
+    }
+  });
+}
 function runtime(env){const m=env.CF_VERSION_METADATA||{};return{ok:true,contractVersion:1,service:SERVICE,repository:REPOSITORY,productionBranch:'main',version:'1.2.0',commit:BUILD_META.commit||null,cloudflareDeploymentId:m.id||null,runtime:'cloudflare-workers',cloudflareVersion:{id:m.id||null,tag:m.tag||null,timestamp:m.timestamp||null},build:BUILD_META,observedAt:new Date().toISOString()}}
 async function health(env){const h=env.CURATOR_ERROR_RECORDS?await env.CURATOR_ERROR_RECORDS.get(HEARTBEAT_KEY,'json'):null;return fresh(h)}
 function fresh(h){const at=h?.at||null,maxAgeMinutes=Number(h?.maxAgeMinutes||2160),ageMinutes=at?Math.floor((Date.now()-Date.parse(at))/60000):null,stale=ageMinutes==null?null:ageMinutes>maxAgeMinutes;return{ok:stale!==true,service:SERVICE,schedule:{cadence:'daily',utcHour:7,utcMinute:17},lastSuccessAt:at,ageMinutes,maxAgeMinutes,stale,status:stale===true?'stale':at?'healthy':'unknown',heartbeat:h?{component:h.component||null,message:h.message||null}:null,checkedAt:new Date().toISOString()}}

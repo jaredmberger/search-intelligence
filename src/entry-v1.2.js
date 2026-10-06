@@ -1,7 +1,7 @@
 import base from './entry-v1.1.js';
 import { BUILD_META } from '../generated/build-meta.js';
 const SERVICE='Search Intelligence',REPOSITORY='jaredmberger/search-intelligence',HEARTBEAT_KEY='heartbeat:search-intelligence:watchtower-snapshot';
-export default{async fetch(request,env,ctx){const u=new URL(request.url);if(request.method==='GET'&&u.pathname==='/api/recovery-export'){const auth=requireRecoveryExportToken(request,env);if(auth)return auth;return recoveryExport(env)}if(request.method==='GET'&&u.pathname==='/api/analysis-export')return analysisExport(request,env,ctx);if(request.method==='GET'&&u.pathname==='/api/runtime')return json(runtime(env));if(request.method==='GET'&&u.pathname==='/api/ops-health')return json(await health(env));return base.fetch(request,env,ctx)},async scheduled(c,e,x){return base.scheduled(c,e,x)}};
+export default{async fetch(request,env,ctx){const u=new URL(request.url);if(request.method==='GET'&&u.pathname==='/api/recovery-export'){const auth=requireRecoveryExportToken(request,env);if(auth)return auth;return recoveryExport(env)}if(request.method==='GET'&&(u.pathname==='/api/analysis-export'||u.pathname==='/analysis-export.json'))return analysisExport(request,env,ctx);if(request.method==='GET'&&u.pathname==='/api/runtime')return json(runtime(env));if(request.method==='GET'&&u.pathname==='/api/ops-health')return json(await health(env));return base.fetch(request,env,ctx)},async scheduled(c,e,x){return base.scheduled(c,e,x)}};
 async function analysisExport(request,env,ctx){
   if(String(env.ANALYSIS_EXPORT_ENABLED||'').toLowerCase()!=='true'){
     return json({ok:false,error:'Analysis export is disabled.'},404);

@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import {classifyInspection} from '../src/inspection-diagnostics.js';
+const clean=classifyInspection({ok:true,verdict:'PASS',robotsTxtState:'ALLOWED',indexingState:'INDEXING_ALLOWED',pageFetchState:'SUCCESSFUL',googleCanonical:'https://www.oceanliners.net/ships/a',userCanonical:'https://www.oceanliners.net/ships/a'});
+assert.equal(clean.signals.length,0);
+const blocked=classifyInspection({ok:true,verdict:'FAIL',robotsTxtState:'DISALLOWED',indexingState:'BLOCKED_BY_META_TAG',pageFetchState:'SUCCESSFUL'});
+assert.deepEqual(blocked.signals.map(x=>x.type),['robots-blocked','indexing-blocked']);
+const mismatch=classifyInspection({ok:true,verdict:'NEUTRAL',googleCanonical:'https://www.oceanliners.net/ships/b',userCanonical:'https://www.oceanliners.net/ships/a'});
+assert.equal(mismatch.signals[0].type,'canonical-mismatch');
+assert.equal(classifyInspection({ok:false,error:'rate limited'}).classification,'unverified');
+console.log('Indexing diagnostic rules passed');

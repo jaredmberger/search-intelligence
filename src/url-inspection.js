@@ -1,3 +1,4 @@
+import {classifyInspection} from './inspection-diagnostics.js';
 const DEFAULT_SITE='sc-domain:oceanliners.net';
 const INSPECTION_ENDPOINT='https://searchconsole.googleapis.com/v1/urlInspection/index:inspect';
 const MAX_URLS=10;
@@ -11,7 +12,7 @@ export async function handleUrlInspection(request,env){
   if(!urls.length)return json({ok:true,checkedUrlCount:0,results:[]});
   const accessToken=await getAccessToken(env);const siteUrl=env.GSC_SITE_URL||DEFAULT_SITE;
   const results=[];
-  for(const inspectionUrl of urls){results.push(await inspectOne(accessToken,siteUrl,inspectionUrl));}
+  for(const inspectionUrl of urls){const observation=await inspectOne(accessToken,siteUrl,inspectionUrl);results.push({...observation,diagnostics:classifyInspection(observation)});}
   return json({ok:true,source:'Google Search Console URL Inspection',checkedUrlCount:results.length,results});
 }
 

@@ -1,3 +1,4 @@
+import {compareQueryWindows} from './query-recovery.js';
 // src/watchtower.js
 
 import { reportSystemSuccess } from "./error-bus.js";
@@ -95,6 +96,9 @@ export async function captureWatchtowerSnapshot(env) {
   );
 
   await pruneFromIndex(env, nextDates);
+  // An independent best-effort diagnostic: failure never marks Watchtower capture as failed.
+  try { await captureQueryRecovery(env,token,site,end); }
+  catch(error){console.error('Query recovery snapshot failed',error?.message||String(error));}
 
   return {
     ok: true,
@@ -958,4 +962,29 @@ function json(value, status = 200) {
       }
     }
   );
+}
+
+const RECOVERY_KEY='query-recovery:latest';
+const BASELINE_START='2026-09-10',BASELINE_END='2026-09-23';
+async function captureQueryRecovery(env,token,site,endDate){
+ const recentEnd=ymd(endDate);
+ const recentStart=ymd(new Date(endDate.getTime()-13*864e5));
+ const common={dimensions:['query'],type:'web',rowLimit:25000,dataState:'final'};
+ const [before,after]=await Promise.all([
+  query(token,site,{...common,startDate:BASELINE_START,endDate:BASELINE_END}),
+  query(token,site,{...common,startDate:recentStart,endDate:recentEnd})
+ ]);
+ const rows=compareQueryWindows(before.rows||[],after.rows||[]);
+ const snapshot={ok:true,source:'Google Search Console Search Analytics',capturedAt:new Date().toISOString(),
+  baseline:{startDate:BASELINE_START,endDate:BASELINE_END,reportedQueryCount:(before.rows||[]).length},
+  recent:{startDate:recentStart,endDate:recentEnd,reportedQueryCount:(after.rows||[]).length},
+  rows,limitations:'14-day windows, query rows may be anonymized/truncated, missing query means unreported rather than zero; average positions reflect reported impressions only.'};
+ await env.SEARCH_INTELLIGENCE_RECORDS.put(RECOVERY_KEY,JSON.stringify(snapshot));
+ return snapshot;
+}
+export async function handleQueryRecovery(request,env){
+ if(request.method!=='GET')return json({ok:false,error:'Method not allowed'},405);
+ if(!env.SEARCH_INTELLIGENCE_RECORDS)return json({ok:false,error:'KV unavailable'},503);
+ const snapshot=await env.SEARCH_INTELLIGENCE_RECORDS.get(RECOVERY_KEY,'json');
+ return snapshot?json(snapshot):json({ok:false,error:'Awaiting first daily recovery snapshot'},503);
 }

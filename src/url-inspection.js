@@ -25,7 +25,18 @@ async function inspectOne(accessToken,siteUrl,inspectionUrl){
   }catch(error){return {url:inspectionUrl,path:safePath(inspectionUrl),ok:false,error:error?.message||String(error)}}
 }
 
-function normalizeSiteUrl(value){try{const u=new URL(String(value||''),'https://oceanliners.net');if(!['oceanliners.net','www.oceanliners.net'].includes(u.hostname.toLowerCase()))return'';u.protocol='https:';u.host='www.oceanliners.net';u.search='';u.hash='';return u.href}catch{return''}}
+export function normalizeSiteUrl(value){
+ try{
+  const raw=String(value||'').trim();
+  // Require an explicit URL to prevent an implicit host choice in canonical audits.
+  if(!/^https:\/\//i.test(raw))return '';
+  const u=new URL(raw);
+  if(!['oceanliners.net','www.oceanliners.net'].includes(u.hostname.toLowerCase())||u.username||u.password||u.port)return '';
+  u.search='';u.hash='';
+  // Preserve the exact requested hostname and trailing slash; Google inspects that URL.
+  return u.href;
+ }catch{return ''}
+}
 function safePath(value){try{return new URL(value).pathname||'/'}catch{return String(value||'')}}
 function hasGoogleConfig(env){return Boolean(env.GOOGLE_CLIENT_ID&&env.GOOGLE_CLIENT_SECRET&&env.GOOGLE_REFRESH_TOKEN&&(env.GSC_SITE_URL||DEFAULT_SITE))}
 async function getAccessToken(env){const body=new URLSearchParams({client_id:env.GOOGLE_CLIENT_ID,client_secret:env.GOOGLE_CLIENT_SECRET,refresh_token:env.GOOGLE_REFRESH_TOKEN,grant_type:'refresh_token'});const r=await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body});const data=await r.json();if(!r.ok||!data.access_token)throw new Error(data.error_description||data.error||'Unable to refresh Google access token.');return data.access_token}

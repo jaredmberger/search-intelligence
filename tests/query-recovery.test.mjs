@@ -1,0 +1,12 @@
+import assert from 'node:assert/strict';
+import {compareQueryWindows} from '../src/query-recovery.js';
+const before=[{keys:['ocean liner'],impressions:100,position:9},{keys:['ship history'],impressions:50,position:15}];
+const after=[{keys:['ocean liner'],impressions:8,position:67}];
+const results=compareQueryWindows(before,after);
+assert.equal(results[0].status,'position-decline');
+assert.equal(results[0].impressionChangePct,-92);
+assert.equal(results[1].status,'not-reported');
+assert.equal(results[1].afterImpressions,null);
+assert.equal(results[1].impressionChangePct,null);
+assert.equal(compareQueryWindows([],[]).length,0);
+console.log('Query recovery comparison tests passed');
